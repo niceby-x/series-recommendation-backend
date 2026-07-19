@@ -7,7 +7,10 @@ import { Series, Rating, ApiResponse } from './types';
 const app = express();
 const PORT = 3001;
 
-app.use(cors());
+app.use(cors({
+    origin: 'https://series-recommendation-frontend.vercel.app'
+}));
+
 app.use(express.json());
 
 //Supabase client
