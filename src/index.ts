@@ -7,8 +7,20 @@ import { Series, Rating, ApiResponse } from './types';
 const app = express();
 const PORT = 3001;
 
+const allowedOrigins = [
+  'http://localhost:3000',
+  'https://series-recommendation-frontend.vercel.app',
+];
+
 app.use(cors({
-    origin: 'https://series-recommendation-frontend.vercel.app'
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json());
