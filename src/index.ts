@@ -261,7 +261,7 @@ app.get('/watchlist/:seriesId', async (req: Request, res: Response) => {
     });
 });
 
-//Route 8 - Remove a series from the watchlist entirely
+// Route 8 - Remove a series from the watchlist entirely
 app.delete('/watchlist/:seriesId', async (req: Request, res: Response) => {
     const user_id = await getOrCreateUserId(req.headers.authorization);
 
@@ -274,16 +274,16 @@ app.delete('/watchlist/:seriesId', async (req: Request, res: Response) => {
     const seriesId = parseInt(req.params.seriesId as string);
 
     const { error } = await supabase
-        .from('user_list')
+        .from('user_lists')
         .delete()
         .eq('user_id', user_id)
         .eq('series_id', seriesId);
 
     if (error) {
-        return res.status(500).json({ message: error.message});
+        return res.status(500).json({ message: error.message });
     }
 
-    res.status(200).json({ message: 'Removed from watchlist'});
+    res.status(200).json({ message: 'Removed from watchlist' });
 });
 
 app.listen(PORT, () => {
