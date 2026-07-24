@@ -139,6 +139,36 @@ async function getOrCreateUserId(authHeader: string | undefined): Promise<number
     return created.id;
 }
 
+// Helper - Verify the request is from the signed-in admin account (checked against
+// the ADMIN_EMAIL env var, never hardcoded). Sends the appropriate error response
+// itself and returns false if the caller should stop; returns true if allowed to proceed.
+async function requireAdmin(req: Request, res: Response): Promise<boolean> {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({ message: 'You must be signed in.' });
+        return false;
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+
+    const { data: { user: authUser }, error: authError } = await supabase.auth.getUser(token);
+
+    if (authError || !authUser) {
+        res.status(401).json({ message: 'Your session is invalid or expired.' });
+        return false;
+    }
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+
+    if (!adminEmail || authUser.email !== adminEmail) {
+        res.status(403).json({ message: 'Admin access required.' });
+        return false;
+    }
+
+    return true;
+}
+
 // Route 4 - Submit a rating
 app.post('/ratings', async (req: Request, res: Response) => {
     const { series_id, score, review_text } = req.body;
@@ -196,7 +226,7 @@ app.post('/watchlist', async (req: Request, res: Response) => {
 
     if (!series_id || !status || !validStatuses.includes(status)) {
         return res.status(400).json({
-            message: `series_id and a valid status (${validStatuses.join(', ')}) are required`
+            message: 'series_id and a valid status (' + validStatuses.join(', ') + ') are required'
         });
     }
 
@@ -296,6 +326,94 @@ app.delete('/watchlist/:seriesId', async (req: Request, res: Response) => {
     }
 
     res.status(200).json({ message: 'Removed from watchlist' });
+});
+
+// Route 9 - List pending TMDB import candidates (admin only)
+app.get('/admin/candidates', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { data, error } = await supabase
+        .from('series_candidates')
+        .select('*')
+        .eq('review_status', 'pending')
+        .order('created_at', { ascending: true });
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({
+        message: 'Pending candidates',
+        count: data.length,
+        data
+    });
+});
+
+// Route 10 - Approve a candidate: copies it into `series`, marks it approved (admin only)
+app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { data: candidate, error: fetchError } = await supabase
+        .from('series_candidates')
+        .select('*')
+        .eq('id', id)
+        .single();
+
+    if (fetchError || !candidate) {
+        return res.status(404).json({ message: 'Candidate not found' });
+    }
+
+    const { error: insertError } = await supabase
+        .from('series')
+        .insert([{
+            title: candidate.title,
+            original_title: candidate.original_title,
+            synopsis: candidate.synopsis,
+            country: candidate.country,
+            year: candidate.year,
+            episode_count: candidate.episode_count,
+            status: candidate.status,
+            poster_url: candidate.poster_url,
+            tmdb_id: candidate.tmdb_id,
+        }]);
+
+    if (insertError) {
+        return res.status(500).json({ message: insertError.message });
+    }
+
+    const { error: updateError } = await supabase
+        .from('series_candidates')
+        .update({ review_status: 'approved' })
+        .eq('id', id);
+
+    if (updateError) {
+        return res.status(500).json({ message: updateError.message });
+    }
+
+    res.status(200).json({ message: 'Approved and added to catalog' });
+});
+
+// Route 11 - Reject a candidate: just marks it rejected, never touches `series` (admin only)
+app.post('/admin/candidates/:id/reject', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { error } = await supabase
+        .from('series_candidates')
+        .update({ review_status: 'rejected' })
+        .eq('id', id);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(200).json({ message: 'Rejected' });
 });
 
 app.listen(PORT, () => {
