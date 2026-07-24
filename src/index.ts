@@ -328,23 +328,32 @@ app.delete('/watchlist/:seriesId', async (req: Request, res: Response) => {
     res.status(200).json({ message: 'Removed from watchlist' });
 });
 
-// Route 9 - List pending TMDB import candidates (admin only)
+// Route 9 - List TMDB import candidates by review status (admin only).
+// Defaults to 'pending'; pass ?status=approved or ?status=rejected for the history views.
 app.get('/admin/candidates', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
+    const validStatuses = ['pending', 'approved', 'rejected'];
+    const statusParam = typeof req.query.status === 'string' ? req.query.status : 'pending';
+    const status = validStatuses.includes(statusParam) ? statusParam : 'pending';
+
+    // Pending candidates are shown oldest-first (a queue to work through);
+    // approved/rejected history is shown most-recent-first (what you just did).
+    const ascending = status === 'pending';
+
     const { data, error } = await supabase
         .from('series_candidates')
         .select('*')
-        .eq('review_status', 'pending')
-        .order('created_at', { ascending: true });
+        .eq('review_status', status)
+        .order('created_at', { ascending });
 
     if (error) {
         return res.status(500).json({ message: error.message });
     }
 
     res.json({
-        message: 'Pending candidates',
+        message: status.charAt(0).toUpperCase() + status.slice(1) + ' candidates',
         count: data.length,
         data
     });
@@ -414,6 +423,48 @@ app.post('/admin/candidates/:id/reject', async (req: Request, res: Response) => 
     }
 
     res.status(200).json({ message: 'Rejected' });
+});
+
+// Route 12 - Restore a candidate back to pending (admin only).
+// If it was approved, this also removes the corresponding row from `series` first,
+// so the catalog stays in sync with what's actually still approved.
+app.post('/admin/candidates/:id/restore', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { data: candidate, error: fetchError } = await supabase
+        .from('series_candidates')
+        .select('*')
+        .eq('id', id)
+        .single();
+
+    if (fetchError || !candidate) {
+        return res.status(404).json({ message: 'Candidate not found' });
+    }
+
+    if (candidate.review_status === 'approved') {
+        const { error: deleteError } = await supabase
+            .from('series')
+            .delete()
+            .eq('tmdb_id', candidate.tmdb_id);
+
+        if (deleteError) {
+            return res.status(500).json({ message: deleteError.message });
+        }
+    }
+
+    const { error: updateError } = await supabase
+        .from('series_candidates')
+        .update({ review_status: 'pending' })
+        .eq('id', id);
+
+    if (updateError) {
+        return res.status(500).json({ message: updateError.message });
+    }
+
+    res.status(200).json({ message: 'Restored to pending' });
 });
 
 app.listen(PORT, () => {
