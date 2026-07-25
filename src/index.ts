@@ -359,12 +359,16 @@ app.get('/admin/candidates', async (req: Request, res: Response) => {
     });
 });
 
-// Route 10 - Approve a candidate: copies it into `series`, marks it approved (admin only)
+// Route 10 - Approve a candidate: copies it into `series`, marks it approved (admin only).
+// Accepts optional field overrides in the request body (title, original_title, country,
+// year, episode_count, status, synopsis) so corrections made during review are saved —
+// both on the series_candidates record itself and on the series row it creates.
 app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
+    const overrides = req.body || {};
 
     const { data: candidate, error: fetchError } = await supabase
         .from('series_candidates')
@@ -376,27 +380,119 @@ app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) =>
         return res.status(404).json({ message: 'Candidate not found' });
     }
 
-    const { error: insertError } = await supabase
+    const finalValues = {
+        title: overrides.title ?? candidate.title,
+        original_title: overrides.original_title ?? candidate.original_title,
+        synopsis: overrides.synopsis ?? candidate.synopsis,
+        country: overrides.country ?? candidate.country,
+        year: overrides.year ?? candidate.year,
+        episode_count: overrides.episode_count ?? candidate.episode_count,
+        status: overrides.status ?? candidate.status,
+    };
+
+    const { data: newSeries, error: insertError } = await supabase
         .from('series')
         .insert([{
-            title: candidate.title,
-            original_title: candidate.original_title,
-            synopsis: candidate.synopsis,
-            country: candidate.country,
-            year: candidate.year,
-            episode_count: candidate.episode_count,
-            status: candidate.status,
+            title: finalValues.title,
+            original_title: finalValues.original_title,
+            synopsis: finalValues.synopsis,
+            country: finalValues.country,
+            year: finalValues.year,
+            episode_count: finalValues.episode_count,
+            status: finalValues.status,
             poster_url: candidate.poster_url,
             tmdb_id: candidate.tmdb_id,
-        }]);
+            is_animated: candidate.is_animated,
+            number_of_seasons: candidate.number_of_seasons,
+            media_type: candidate.media_type,
+        }])
+        .select('id')
+        .single();
 
-    if (insertError) {
-        return res.status(500).json({ message: insertError.message });
+    if (insertError || !newSeries) {
+        return res.status(500).json({ message: insertError?.message || 'Failed to create series' });
+    }
+
+    // Link genres: find-or-create each by name, then link via series_genres.
+    // Failures here are logged but don't block the approval — the series itself is already saved.
+    for (const genreName of (candidate.genre_names || [])) {
+        const { data: existingGenre } = await supabase
+            .from('genres')
+            .select('id')
+            .eq('name', genreName)
+            .maybeSingle();
+
+        let genreId = existingGenre?.id;
+
+        if (!genreId) {
+            const { data: createdGenre, error: genreError } = await supabase
+                .from('genres')
+                .insert([{ name: genreName }])
+                .select('id')
+                .single();
+
+            if (genreError || !createdGenre) {
+                console.error('Failed to create genre "' + genreName + '": ' + genreError?.message);
+                continue;
+            }
+            genreId = createdGenre.id;
+        }
+
+        const { error: linkError } = await supabase
+            .from('series_genres')
+            .insert([{ series_id: newSeries.id, genre_id: genreId }]);
+
+        if (linkError) {
+            console.error('Failed to link genre "' + genreName + '": ' + linkError.message);
+        }
+    }
+
+    // Link cast: find-or-create each cast member by name, then link via series_cast.
+    // First two cast entries (TMDB's own billing order) are marked as leads.
+    const castList = (candidate.cast_json || []) as { name: string; character: string; photo_url: string | null }[];
+
+    for (let i = 0; i < castList.length; i++) {
+        const castEntry = castList[i];
+
+        const { data: existingCast } = await supabase
+            .from('cast_members')
+            .select('id')
+            .eq('name', castEntry.name)
+            .maybeSingle();
+
+        let castMemberId = existingCast?.id;
+
+        if (!castMemberId) {
+            const { data: createdCast, error: castError } = await supabase
+                .from('cast_members')
+                .insert([{ name: castEntry.name, photo_url: castEntry.photo_url, bio: null }])
+                .select('id')
+                .single();
+
+            if (castError || !createdCast) {
+                console.error('Failed to create cast member "' + castEntry.name + '": ' + castError?.message);
+                continue;
+            }
+            castMemberId = createdCast.id;
+        }
+
+        const { error: castLinkError } = await supabase
+            .from('series_cast')
+            .insert([{
+                series_id: newSeries.id,
+                cast_member_id: castMemberId,
+                role_name: castEntry.character || null,
+                is_lead: i < 2,
+            }]);
+
+        if (castLinkError) {
+            console.error('Failed to link cast member "' + castEntry.name + '": ' + castLinkError.message);
+        }
     }
 
     const { error: updateError } = await supabase
         .from('series_candidates')
-        .update({ review_status: 'approved' })
+        .update({ ...finalValues, review_status: 'approved' })
         .eq('id', id);
 
     if (updateError) {

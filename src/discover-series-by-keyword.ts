@@ -8,7 +8,7 @@ const supabase = createClient(
 
 const TMDB_TOKEN = process.env.TMDB_ACCESS_TOKEN as string;
 
-// Maps TMDB origin_country codes to the country labels your `series` table uses.
+// Maps TMDB origin_country / production_countries codes to the country labels your `series` table uses.
 const COUNTRY_CODE_LABELS: Record<string, string> = {
     TH: 'Thailand',
     KR: 'Korea',
@@ -18,7 +18,7 @@ const COUNTRY_CODE_LABELS: Record<string, string> = {
     HK: 'Hong Kong',
 };
 
-// Fallback when TMDB has no origin_country data for a result — guesses from original_language instead.
+// Fallback when TMDB has no country data for a result — guesses from original_language instead.
 const LANGUAGE_FALLBACK_LABELS: Record<string, string> = {
     th: 'Thailand',
     ko: 'Korea',
@@ -26,11 +26,11 @@ const LANGUAGE_FALLBACK_LABELS: Record<string, string> = {
     zh: 'China',
 };
 
-// Safety cap on how many TMDB result pages to walk through in one run (20 results per page).
+// Safety cap on how many TMDB result pages to walk through per media type in one run (20 results per page).
 const MAX_PAGES = 50;
 
-// Safety cap on how many new series to insert in one run, so a single run stays reviewable.
-// Override with --limit=300 on the command line if you want a bigger harvest pass.
+// Safety cap on how many new candidates to queue in one run (across both TV and movies combined),
+// so a single run stays reviewable. Override with --limit=300 on the command line.
 const DEFAULT_LIMIT = 150;
 
 const TMDB_HEADERS = {
@@ -41,24 +41,43 @@ const TMDB_HEADERS = {
 const DRY_RUN = process.argv.includes('--dry-run');
 let SOURCE_KEYWORD = "boys' love (bl)";
 
-interface TMDBDiscoverResult {
-    id: number;
+type MediaType = 'tv' | 'movie';
+
+const ANIMATION_GENRE_ID = 16;
+const MAX_CAST_MEMBERS = 6;
+
+interface TMDBCastMember {
     name: string;
-    original_name: string;
+    character: string;
+    profile_path: string | null;
+}
+
+// A result normalized from either /discover/tv or /discover/movie into one common shape.
+interface NormalizedResult {
+    tmdbId: number;
+    title: string;
+    originalTitle: string;
     overview: string;
-    poster_path: string | null;
-    first_air_date: string | null;
-    origin_country: string[];
-    original_language: string;
+    posterPath: string | null;
+    year: number | null;
+    originCountry: string[];
+    originalLanguage: string;
+    mediaType: MediaType;
 }
 
-interface TMDBSeriesDetails {
-    number_of_episodes: number | null;
+// Details normalized from either /tv/{id} or /movie/{id} into one common shape.
+interface NormalizedDetails {
+    episodeCount: number;
+    numberOfSeasons: number | null;
     status: string;
+    genres: { id: number; name: string }[];
+    cast: TMDBCastMember[];
+    countryCodes: string[];
 }
 
-// Look up the TMDB keyword ID for "boys' love (bl)" so we can filter /discover/tv by it.
-// Known id is 289844, but we still search by name to stay resilient if TMDB ever changes ids.
+// Look up the TMDB keyword ID for "boys' love (bl)". Known id is 289844, but we still
+// search by name to stay resilient if TMDB ever changes ids. The same keyword id works
+// for both /discover/tv and /discover/movie, since TMDB keywords are shared across media types.
 async function getBoysLoveKeywordId(): Promise<number | null> {
     const url = 'https://api.themoviedb.org/3/search/keyword?query=' + encodeURIComponent("boys' love");
 
@@ -85,8 +104,9 @@ async function getBoysLoveKeywordId(): Promise<number | null> {
     return match.id;
 }
 
-async function discoverPage(keywordId: number, page: number): Promise<TMDBDiscoverResult[]> {
-    const url = 'https://api.themoviedb.org/3/discover/tv'
+async function discoverPage(keywordId: number, mediaType: MediaType, page: number): Promise<NormalizedResult[]> {
+    const endpoint = mediaType === 'tv' ? 'discover/tv' : 'discover/movie';
+    const url = 'https://api.themoviedb.org/3/' + endpoint
         + '?with_keywords=' + keywordId
         + '&sort_by=popularity.desc'
         + '&page=' + page;
@@ -94,17 +114,45 @@ async function discoverPage(keywordId: number, page: number): Promise<TMDBDiscov
     const res = await fetch(url, { headers: TMDB_HEADERS });
 
     if (!res.ok) {
-        console.error('  Discover request failed on page ' + page + ': ' + res.status);
+        console.error('  Discover request failed on page ' + page + ' (' + mediaType + '): ' + res.status);
         return [];
     }
 
     const json = await res.json();
-    console.log('  [debug] page ' + page + ': ' + (json.total_results ?? 0) + ' total results, ' + (json.results?.length ?? 0) + ' on this page');
-    return json.results || [];
+    console.log('  [debug] ' + mediaType + ' page ' + page + ': ' + (json.total_results ?? 0) + ' total results, ' + (json.results?.length ?? 0) + ' on this page');
+
+    const results = json.results || [];
+
+    if (mediaType === 'tv') {
+        return results.map((r: any) => ({
+            tmdbId: r.id,
+            title: r.name,
+            originalTitle: r.original_name,
+            overview: r.overview,
+            posterPath: r.poster_path,
+            year: r.first_air_date ? parseInt(r.first_air_date.slice(0, 4)) : null,
+            originCountry: r.origin_country || [],
+            originalLanguage: r.original_language,
+            mediaType: 'tv' as MediaType,
+        }));
+    }
+
+    return results.map((r: any) => ({
+        tmdbId: r.id,
+        title: r.title,
+        originalTitle: r.original_title,
+        overview: r.overview,
+        posterPath: r.poster_path,
+        year: r.release_date ? parseInt(r.release_date.slice(0, 4)) : null,
+        originCountry: [],
+        originalLanguage: r.original_language,
+        mediaType: 'movie' as MediaType,
+    }));
 }
 
-async function getSeriesDetails(tmdbId: number): Promise<TMDBSeriesDetails | null> {
-    const url = 'https://api.themoviedb.org/3/tv/' + tmdbId;
+async function getDetails(tmdbId: number, mediaType: MediaType): Promise<NormalizedDetails | null> {
+    const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
+    const url = 'https://api.themoviedb.org/3/' + endpoint + '/' + tmdbId + '?append_to_response=credits';
 
     const res = await fetch(url, { headers: TMDB_HEADERS });
 
@@ -114,16 +162,41 @@ async function getSeriesDetails(tmdbId: number): Promise<TMDBSeriesDetails | nul
 
     const json = await res.json();
 
+    const cast: TMDBCastMember[] = (json.credits?.cast || [])
+        .slice(0, MAX_CAST_MEMBERS)
+        .map((c: { name: string; character: string; profile_path: string | null }) => ({
+            name: c.name,
+            character: c.character,
+            profile_path: c.profile_path,
+        }));
+
+    if (mediaType === 'tv') {
+        return {
+            episodeCount: json.number_of_episodes ?? 0,
+            numberOfSeasons: json.number_of_seasons ?? null,
+            status: json.status || 'Unknown',
+            genres: json.genres || [],
+            cast,
+            countryCodes: [],
+        };
+    }
+
+    const countryCodes = (json.production_countries || []).map((c: { iso_3166_1: string }) => c.iso_3166_1);
+
     return {
-        number_of_episodes: json.number_of_episodes ?? null,
+        episodeCount: 1,
+        numberOfSeasons: null,
         status: json.status || 'Unknown',
+        genres: json.genres || [],
+        cast,
+        countryCodes,
     };
 }
 
-// Resolves a TMDB result's real-world country: prefers origin_country, falls back to
-// original_language, falls back to "Other" if neither maps to something we recognize.
-function resolveCountry(originCountry: string[], originalLanguage: string): string {
-    for (const code of originCountry) {
+// Resolves a result's real-world country: prefers country codes (origin_country for TV,
+// production_countries for movies), falls back to original_language, falls back to "Other".
+function resolveCountry(countryCodes: string[], originalLanguage: string): string {
+    for (const code of countryCodes) {
         if (COUNTRY_CODE_LABELS[code]) {
             return COUNTRY_CODE_LABELS[code];
         }
@@ -136,9 +209,11 @@ function resolveCountry(originCountry: string[], originalLanguage: string): stri
     return 'Other';
 }
 
-function mapStatus(tmdbStatus: string): string {
-    // TMDB uses statuses like "Ended", "Canceled", "Returning Series", "In Production".
-    // Your table's existing convention is 'completed' / 'airing'.
+function mapStatus(mediaType: MediaType, tmdbStatus: string): string {
+    if (mediaType === 'movie') {
+        return 'completed';
+    }
+
     if (tmdbStatus === 'Ended' || tmdbStatus === 'Canceled') {
         return 'completed';
     }
@@ -158,7 +233,7 @@ async function run() {
     }
 
     const limit = parseLimitArg();
-    console.log('Run limit: ' + limit + ' new candidates to queue (override with --limit=N)\n');
+    console.log('Run limit: ' + limit + ' new candidates per media type (TV and Movies each get their own budget) — override with --limit=N\n');
 
     const keywordId = await getBoysLoveKeywordId();
 
@@ -167,9 +242,6 @@ async function run() {
         return;
     }
 
-    // Pull everything already in the catalog AND already-queued candidates once, up front,
-    // instead of one round-trip per candidate. This way we never re-suggest something that's
-    // already live, already pending review, or already rejected.
     const { data: existingSeries, error: existingSeriesError } = await supabase
         .from('series')
         .select('title, tmdb_id');
@@ -200,82 +272,110 @@ async function run() {
     console.log('Loaded ' + existingSeries.length + ' catalog series and ' + existingCandidates.length + ' existing candidates for dedupe.\n');
 
     const countryTally: Record<string, number> = {};
+    const mediaTypeTally: Record<string, number> = { tv: 0, movie: 0 };
     let added = 0;
-    let page = 1;
 
-    while (added < limit && page <= MAX_PAGES) {
-        const results = await discoverPage(keywordId, page);
+    for (const mediaType of ['tv', 'movie'] as MediaType[]) {
+        console.log('\n=== Searching ' + mediaType.toUpperCase() + ' ===');
 
-        if (results.length === 0) {
-            break;
-        }
+        let page = 1;
+        let addedForType = 0;
 
-        for (const result of results) {
-            if (added >= limit) {
+        while (addedForType < limit && page <= MAX_PAGES) {
+            const results = await discoverPage(keywordId, mediaType, page);
+
+            if (results.length === 0) {
                 break;
             }
 
-            if (!result.name || !result.poster_path) {
-                console.log('  [debug] skipping "' + (result.name || '(untitled)') + '" — missing name or poster');
-                continue;
-            }
+            for (const result of results) {
+                if (addedForType >= limit) {
+                    break;
+                }
 
-            if (existingTmdbIds.has(result.id) || existingTitles.has(result.name)) {
-                console.log('  Skipping "' + result.name + '" (already queued or in catalog)');
-                continue;
-            }
+                if (!result.title || !result.posterPath) {
+                    console.log('  [debug] skipping "' + (result.title || '(untitled)') + '" — missing title or poster');
+                    continue;
+                }
 
-            const details = await getSeriesDetails(result.id);
+                if (existingTmdbIds.has(result.tmdbId) || existingTitles.has(result.title)) {
+                    console.log('  Skipping "' + result.title + '" (already queued or in catalog)');
+                    continue;
+                }
 
-            const year = result.first_air_date ? parseInt(result.first_air_date.slice(0, 4)) : null;
-            const episodeCount = details?.number_of_episodes || 0;
-            const status = details ? mapStatus(details.status) : 'completed';
-            const resolvedCountry = resolveCountry(result.origin_country || [], result.original_language);
+                const details = await getDetails(result.tmdbId, mediaType);
 
-            if (DRY_RUN) {
-                console.log('  [DRY RUN] Would queue "' + result.name + '" (' + resolvedCountry + ', ' + year + ', '
-                    + episodeCount + ' eps, ' + status + ')');
-                countryTally[resolvedCountry] = (countryTally[resolvedCountry] || 0) + 1;
-                added++;
-                existingTitles.add(result.name);
+                const episodeCount = details?.episodeCount ?? (mediaType === 'movie' ? 1 : 0);
+                const status = details ? mapStatus(mediaType, details.status) : 'completed';
+                const countryCodes = mediaType === 'tv' ? result.originCountry : (details?.countryCodes || []);
+                const resolvedCountry = resolveCountry(countryCodes, result.originalLanguage);
+                const isAnimated = details ? details.genres.some((g) => g.id === ANIMATION_GENRE_ID) : false;
+                const numberOfSeasons = details?.numberOfSeasons ?? null;
+                const genreNames = details ? details.genres.map((g) => g.name) : [];
+                const castJson = details
+                    ? details.cast.map((c) => ({
+                        name: c.name,
+                        character: c.character,
+                        photo_url: c.profile_path ? 'https://image.tmdb.org/t/p/w200' + c.profile_path : null,
+                    }))
+                    : [];
+
+                if (DRY_RUN) {
+                    console.log('  [DRY RUN] Would queue "' + result.title + '" [' + mediaType + '] (' + resolvedCountry + ', ' + result.year + ', '
+                        + episodeCount + ' eps, ' + numberOfSeasons + ' seasons, ' + status + (isAnimated ? ', ANIMATED' : '') + ', '
+                        + genreNames.join('/') + ', cast: ' + castJson.map((c) => c.name).join(', ') + ')');
+                    countryTally[resolvedCountry] = (countryTally[resolvedCountry] || 0) + 1;
+                    mediaTypeTally[mediaType]++;
+                    added++;
+                    addedForType++;
+                    existingTitles.add(result.title);
+                    await new Promise((resolve) => setTimeout(resolve, 300));
+                    continue;
+                }
+
+                const { error: insertError } = await supabase
+                    .from('series_candidates')
+                    .insert([{
+                        title: result.title,
+                        original_title: result.originalTitle || null,
+                        country: resolvedCountry,
+                        year: result.year,
+                        episode_count: episodeCount,
+                        status: status,
+                        synopsis: result.overview || '',
+                        poster_url: 'https://image.tmdb.org/t/p/w500' + result.posterPath,
+                        tmdb_id: result.tmdbId,
+                        source_keyword: SOURCE_KEYWORD,
+                        review_status: 'pending',
+                        is_animated: isAnimated,
+                        number_of_seasons: numberOfSeasons,
+                        genre_names: genreNames,
+                        cast_json: castJson,
+                        media_type: mediaType,
+                    }]);
+
+                if (insertError) {
+                    console.error('  Failed to queue "' + result.title + '": ' + insertError.message);
+                } else {
+                    console.log('  Queued "' + result.title + '" [' + mediaType + '] (' + resolvedCountry + ', ' + result.year + ') for review');
+                    countryTally[resolvedCountry] = (countryTally[resolvedCountry] || 0) + 1;
+                    mediaTypeTally[mediaType]++;
+                    added++;
+                    addedForType++;
+                    existingTitles.add(result.title);
+                    existingTmdbIds.add(result.tmdbId);
+                }
+
                 await new Promise((resolve) => setTimeout(resolve, 300));
-                continue;
             }
 
-            const { error: insertError } = await supabase
-                .from('series_candidates')
-                .insert([{
-                    title: result.name,
-                    original_title: result.original_name || null,
-                    country: resolvedCountry,
-                    year: year,
-                    episode_count: episodeCount,
-                    status: status,
-                    synopsis: result.overview || '',
-                    poster_url: 'https://image.tmdb.org/t/p/w500' + result.poster_path,
-                    tmdb_id: result.id,
-                    source_keyword: SOURCE_KEYWORD,
-                    review_status: 'pending',
-                }]);
-
-            if (insertError) {
-                console.error('  Failed to queue "' + result.name + '": ' + insertError.message);
-            } else {
-                console.log('  Queued "' + result.name + '" (' + resolvedCountry + ', ' + year + ') for review');
-                countryTally[resolvedCountry] = (countryTally[resolvedCountry] || 0) + 1;
-                added++;
-                existingTitles.add(result.name);
-                existingTmdbIds.add(result.id);
-            }
-
-            await new Promise((resolve) => setTimeout(resolve, 300));
+            page++;
         }
-
-        page++;
     }
 
     console.log('\n=== Summary ===');
     console.log(added + ' new candidates ' + (DRY_RUN ? 'would be queued' : 'queued for review') + ' total:');
+    console.log('  TV: ' + mediaTypeTally.tv + ', Movies: ' + mediaTypeTally.movie);
     for (const [country, count] of Object.entries(countryTally)) {
         console.log('  ' + country + ': ' + count);
     }
