@@ -344,7 +344,7 @@ app.get('/admin/candidates', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
         .from('series_candidates')
-        .select('*')
+        .select('*, series_candidate_tags (tag_id)')
         .eq('review_status', status)
         .order('created_at', { ascending });
 
@@ -352,10 +352,18 @@ app.get('/admin/candidates', async (req: Request, res: Response) => {
         return res.status(500).json({ message: error.message });
     }
 
+    // Flatten the joined tag rows into a plain tag_ids array — the nested
+    // series_candidate_tags shape is a Supabase/Postgres join artifact,
+    // not something the frontend should need to know about.
+    const flattened = data.map((row: any) => {
+        const { series_candidate_tags, ...rest } = row;
+        return { ...rest, tag_ids: (series_candidate_tags || []).map((t: any) => t.tag_id) };
+    });
+
     res.json({
         message: status.charAt(0).toUpperCase() + status.slice(1) + ' candidates',
-        count: data.length,
-        data
+        count: flattened.length,
+        data: flattened
     });
 });
 
@@ -383,6 +391,106 @@ app.get('/admin/candidates/counts', async (req: Request, res: Response) => {
         approved: approved.count || 0,
         rejected: rejected.count || 0,
     });
+});
+
+// Route 9c - Get all active taxonomy tags, grouped by dimension (admin only).
+// Fetched once by the admin page on load, not per candidate row.
+app.get('/admin/tags', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { data, error } = await supabase
+        .from('tags')
+        .select('id, dimension, value_key, display_label, display_emoji, sort_order')
+        .eq('is_active', true)
+        .order('dimension', { ascending: true })
+        .order('sort_order', { ascending: true });
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    const grouped: Record<string, typeof data> = {};
+    for (const tag of data) {
+        if (!grouped[tag.dimension]) grouped[tag.dimension] = [];
+        grouped[tag.dimension].push(tag);
+    }
+
+    res.json({ message: 'Tags by dimension', data: grouped });
+});
+
+// Route 9d - Save a candidate's taxonomy (Curated Attributes + Discovery Tags) (admin only).
+// Persists immediately, independent of approve/reject — this is what lets curation happen
+// progressively across sessions, per BLumi Taxonomy v1. Body: { romance_pace?, emotional_intensity?,
+// ending_type?, content_level?, tag_ids?: number[] }. tag_ids, if present, is the COMPLETE
+// desired set of tag ids across all 5 Discovery Tag dimensions — this route diffs against
+// what's currently linked rather than requiring the client to compute the diff.
+app.patch('/admin/candidates/:id/taxonomy', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const { romance_pace, emotional_intensity, ending_type, content_level, tag_ids } = req.body;
+
+    const attributeUpdate: Record<string, unknown> = {};
+    if (romance_pace !== undefined) attributeUpdate.romance_pace = romance_pace;
+    if (emotional_intensity !== undefined) attributeUpdate.emotional_intensity = emotional_intensity;
+    if (ending_type !== undefined) attributeUpdate.ending_type = ending_type;
+    if (content_level !== undefined) attributeUpdate.content_level = content_level;
+    // content_level intentionally has no default fallback — a client-sent `null` is a
+    // deliberate "needs review" state (per Taxonomy v1 §2.4), not an error to correct.
+
+    if (Object.keys(attributeUpdate).length > 0) {
+        const { error: attrError } = await supabase
+            .from('series_candidates')
+            .update(attributeUpdate)
+            .eq('id', id);
+
+        if (attrError) {
+            return res.status(500).json({ message: attrError.message });
+        }
+    }
+
+    if (Array.isArray(tag_ids)) {
+        const { data: existing, error: fetchError } = await supabase
+            .from('series_candidate_tags')
+            .select('tag_id')
+            .eq('candidate_id', id);
+
+        if (fetchError) {
+            return res.status(500).json({ message: fetchError.message });
+        }
+
+        const existingIds = new Set((existing || []).map((row) => row.tag_id));
+        const desiredIds = new Set(tag_ids as number[]);
+
+        const toInsert = (tag_ids as number[]).filter((tagId) => !existingIds.has(tagId));
+        const toDelete = [...existingIds].filter((tagId) => !desiredIds.has(tagId));
+
+        if (toInsert.length > 0) {
+            const { error: insertError } = await supabase
+                .from('series_candidate_tags')
+                .insert(toInsert.map((tagId) => ({ candidate_id: id, tag_id: tagId })));
+
+            if (insertError) {
+                return res.status(500).json({ message: insertError.message });
+            }
+        }
+
+        if (toDelete.length > 0) {
+            const { error: deleteError } = await supabase
+                .from('series_candidate_tags')
+                .delete()
+                .eq('candidate_id', id)
+                .in('tag_id', toDelete);
+
+            if (deleteError) {
+                return res.status(500).json({ message: deleteError.message });
+            }
+        }
+    }
+
+    res.status(200).json({ message: 'Taxonomy saved' });
 });
 
 // Route 10 - Approve a candidate: copies it into `series`, marks it approved (admin only).
@@ -414,7 +522,44 @@ app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) =>
         year: overrides.year ?? candidate.year,
         episode_count: overrides.episode_count ?? candidate.episode_count,
         status: overrides.status ?? candidate.status,
+        romance_pace: overrides.romance_pace ?? candidate.romance_pace,
+        emotional_intensity: overrides.emotional_intensity ?? candidate.emotional_intensity,
+        ending_type: overrides.ending_type ?? candidate.ending_type,
+        content_level: overrides.content_level ?? candidate.content_level,
     };
+
+    // Level 1 gate (BLumi Taxonomy v1 §1) — Romance Pace, Ending Type, and at least one
+    // tag each from Mood / Trope / Relationship Dynamics are required before a title can
+    // go live. The DB columns stay nullable so curation can happen progressively before
+    // this point (see Route 9d) — this is where the requirement is actually enforced.
+    if (!finalValues.romance_pace || !finalValues.ending_type) {
+        return res.status(400).json({
+            message: 'Cannot approve: Romance Pace and Ending Type are required (Taxonomy v1 Level 1).'
+        });
+    }
+
+    const { data: candidateTagRows, error: candidateTagsError } = await supabase
+        .from('series_candidate_tags')
+        .select('tag_id, tags (dimension)')
+        .eq('candidate_id', id);
+
+    if (candidateTagsError) {
+        return res.status(500).json({ message: candidateTagsError.message });
+    }
+
+    const taggedDimensions = new Set(
+        (candidateTagRows || []).map((row: any) => row.tags?.dimension).filter(Boolean)
+    );
+
+    const missingDimensions = ['mood', 'trope', 'relationship_dynamic'].filter(
+        (dimension) => !taggedDimensions.has(dimension)
+    );
+
+    if (missingDimensions.length > 0) {
+        return res.status(400).json({
+            message: 'Cannot approve: at least one tag is required in each of Mood, Trope, and Relationship Dynamics (Taxonomy v1 Level 1). Missing: ' + missingDimensions.join(', ')
+        });
+    }
 
     const { data: newSeries, error: insertError } = await supabase
         .from('series')
@@ -426,6 +571,10 @@ app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) =>
             year: finalValues.year,
             episode_count: finalValues.episode_count,
             status: finalValues.status,
+            romance_pace: finalValues.romance_pace,
+            emotional_intensity: finalValues.emotional_intensity,
+            ending_type: finalValues.ending_type,
+            content_level: finalValues.content_level,
             poster_url: candidate.poster_url,
             tmdb_id: candidate.tmdb_id,
             is_animated: candidate.is_animated,
@@ -516,6 +665,25 @@ app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) =>
         }
     }
 
+    // Copy taxonomy tags: unlike genres/cast, tag_ids already point into the shared
+    // `tags` table, so this is a straight copy — no find-or-create needed.
+    const { error: candidateTagsForCopyError, data: tagsToCopy } = await supabase
+        .from('series_candidate_tags')
+        .select('tag_id')
+        .eq('candidate_id', id);
+
+    if (candidateTagsForCopyError) {
+        console.error('Failed to fetch candidate tags for copy: ' + candidateTagsForCopyError.message);
+    } else if (tagsToCopy && tagsToCopy.length > 0) {
+        const { error: tagCopyError } = await supabase
+            .from('series_tags')
+            .insert(tagsToCopy.map((row) => ({ series_id: newSeries.id, tag_id: row.tag_id })));
+
+        if (tagCopyError) {
+            console.error('Failed to copy tags to series ' + newSeries.id + ': ' + tagCopyError.message);
+        }
+    }
+
     const { error: updateError } = await supabase
         .from('series_candidates')
         .update({ ...finalValues, review_status: 'approved' })
@@ -592,6 +760,15 @@ app.post('/admin/candidates/:id/restore', async (req: Request, res: Response) =>
 
             if (castLinkDeleteError) {
                 return res.status(500).json({ message: castLinkDeleteError.message });
+            }
+
+            const { error: tagLinkDeleteError } = await supabase
+                .from('series_tags')
+                .delete()
+                .eq('series_id', seriesRow.id);
+
+            if (tagLinkDeleteError) {
+                return res.status(500).json({ message: tagLinkDeleteError.message });
             }
         }
 
