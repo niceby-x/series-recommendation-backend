@@ -359,6 +359,32 @@ app.get('/admin/candidates', async (req: Request, res: Response) => {
     });
 });
 
+// Route 9b - Lightweight counts for all three review statuses at once (admin only).
+// Uses count-only queries (head: true) so this stays cheap even with a large queue.
+app.get('/admin/candidates/counts', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const [pending, approved, rejected] = await Promise.all([
+        supabase.from('series_candidates').select('*', { count: 'exact', head: true }).eq('review_status', 'pending'),
+        supabase.from('series_candidates').select('*', { count: 'exact', head: true }).eq('review_status', 'approved'),
+        supabase.from('series_candidates').select('*', { count: 'exact', head: true }).eq('review_status', 'rejected'),
+    ]);
+
+    if (pending.error || approved.error || rejected.error) {
+        return res.status(500).json({
+            message: pending.error?.message || approved.error?.message || rejected.error?.message
+        });
+    }
+
+    res.json({
+        message: 'Candidate counts',
+        pending: pending.count || 0,
+        approved: approved.count || 0,
+        rejected: rejected.count || 0,
+    });
+});
+
 // Route 10 - Approve a candidate: copies it into `series`, marks it approved (admin only).
 // Accepts optional field overrides in the request body (title, original_title, country,
 // year, episode_count, status, synopsis) so corrections made during review are saved —
@@ -541,6 +567,34 @@ app.post('/admin/candidates/:id/restore', async (req: Request, res: Response) =>
     }
 
     if (candidate.review_status === 'approved') {
+        const { data: seriesRow } = await supabase
+            .from('series')
+            .select('id')
+            .eq('tmdb_id', candidate.tmdb_id)
+            .maybeSingle();
+
+        if (seriesRow) {
+            // Clean up link table rows explicitly first — don't rely on ON DELETE CASCADE
+            // being configured, since we can't be sure it is.
+            const { error: genreLinkDeleteError } = await supabase
+                .from('series_genres')
+                .delete()
+                .eq('series_id', seriesRow.id);
+
+            if (genreLinkDeleteError) {
+                return res.status(500).json({ message: genreLinkDeleteError.message });
+            }
+
+            const { error: castLinkDeleteError } = await supabase
+                .from('series_cast')
+                .delete()
+                .eq('series_id', seriesRow.id);
+
+            if (castLinkDeleteError) {
+                return res.status(500).json({ message: castLinkDeleteError.message });
+            }
+        }
+
         const { error: deleteError } = await supabase
             .from('series')
             .delete()
