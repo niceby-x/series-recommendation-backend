@@ -528,38 +528,15 @@ app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) =>
         content_level: overrides.content_level ?? candidate.content_level,
     };
 
-    // Level 1 gate (BLumi Taxonomy v1 §1) — Romance Pace, Ending Type, and at least one
-    // tag each from Mood / Trope / Relationship Dynamics are required before a title can
-    // go live. The DB columns stay nullable so curation can happen progressively before
-    // this point (see Route 9d) — this is where the requirement is actually enforced.
-    if (!finalValues.romance_pace || !finalValues.ending_type) {
-        return res.status(400).json({
-            message: 'Cannot approve: Romance Pace and Ending Type are required (Taxonomy v1 Level 1).'
-        });
-    }
-
-    const { data: candidateTagRows, error: candidateTagsError } = await supabase
-        .from('series_candidate_tags')
-        .select('tag_id, tags (dimension)')
-        .eq('candidate_id', id);
-
-    if (candidateTagsError) {
-        return res.status(500).json({ message: candidateTagsError.message });
-    }
-
-    const taggedDimensions = new Set(
-        (candidateTagRows || []).map((row: any) => row.tags?.dimension).filter(Boolean)
-    );
-
-    const missingDimensions = ['mood', 'trope', 'relationship_dynamic'].filter(
-        (dimension) => !taggedDimensions.has(dimension)
-    );
-
-    if (missingDimensions.length > 0) {
-        return res.status(400).json({
-            message: 'Cannot approve: at least one tag is required in each of Mood, Trope, and Relationship Dynamics (Taxonomy v1 Level 1). Missing: ' + missingDimensions.join(', ')
-        });
-    }
+    // NOTE: Taxonomy v1 Level 1 fields (Romance Pace, Ending Type, Mood/Trope/
+    // Relationship Dynamics tags) are NOT required to approve a candidate. A title
+    // can go live with just its Core Metadata (title, genres, cast, synopsis) and
+    // simply won't surface in mood/trope-based discovery until tagged — it stays
+    // browsable by title/genre/country in the meantime. Curation Level exists as an
+    // admin-visible signal of what's missing, not a publish gate. This was
+    // deliberately relaxed from an earlier hard-block version once the pending
+    // queue reached ~300 titles and manual per-title tagging became the bottleneck
+    // for approving anything at all.
 
     const { data: newSeries, error: insertError } = await supabase
         .from('series')
