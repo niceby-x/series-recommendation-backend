@@ -59,6 +59,7 @@ interface NormalizedResult {
     originalTitle: string;
     overview: string;
     posterPath: string | null;
+    backdropPath: string | null;
     year: number | null;
     originCountry: string[];
     originalLanguage: string;
@@ -130,6 +131,7 @@ async function discoverPage(keywordId: number, mediaType: MediaType, page: numbe
             originalTitle: r.original_name,
             overview: r.overview,
             posterPath: r.poster_path,
+            backdropPath: r.backdrop_path,
             year: r.first_air_date ? parseInt(r.first_air_date.slice(0, 4)) : null,
             originCountry: r.origin_country || [],
             originalLanguage: r.original_language,
@@ -143,6 +145,7 @@ async function discoverPage(keywordId: number, mediaType: MediaType, page: numbe
         originalTitle: r.original_title,
         overview: r.overview,
         posterPath: r.poster_path,
+        backdropPath: r.backdrop_path,
         year: r.release_date ? parseInt(r.release_date.slice(0, 4)) : null,
         originCountry: [],
         originalLanguage: r.original_language,
@@ -344,6 +347,7 @@ async function run() {
                         status: status,
                         synopsis: result.overview || '',
                         poster_url: 'https://image.tmdb.org/t/p/w500' + result.posterPath,
+                        backdrop_url: result.backdropPath ? 'https://image.tmdb.org/t/p/w1280' + result.backdropPath : null,
                         tmdb_id: result.tmdbId,
                         source_keyword: SOURCE_KEYWORD,
                         review_status: 'pending',

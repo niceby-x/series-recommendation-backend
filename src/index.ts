@@ -553,6 +553,7 @@ app.post('/admin/candidates/:id/approve', async (req: Request, res: Response) =>
             ending_type: finalValues.ending_type,
             content_level: finalValues.content_level,
             poster_url: candidate.poster_url,
+            backdrop_url: candidate.backdrop_url,
             tmdb_id: candidate.tmdb_id,
             is_animated: candidate.is_animated,
             number_of_seasons: candidate.number_of_seasons,

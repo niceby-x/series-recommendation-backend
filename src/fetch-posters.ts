@@ -14,7 +14,12 @@ interface Series {
     year: number;
 }
 
-async function searchTMDBPoster(title: string, year: number): Promise<string | null> {
+interface TMDBImageUrls {
+    posterUrl: string | null;
+    backdropUrl: string | null;
+}
+
+async function searchTMDBImages(title: string, year: number): Promise<TMDBImageUrls> {
     const url = `https://api.themoviedb.org/3/search/tv?query=${encodeURIComponent(title)}&first_air_date_year=${year}`;
 
     const res = await fetch(url, {
@@ -26,25 +31,27 @@ async function searchTMDBPoster(title: string, year: number): Promise<string | n
 
     if (!res.ok) {
         console.error(`  TMDB request failed for "${title}": ${res.status}`);
-        return null;
+        return { posterUrl: null, backdropUrl: null };
     }
 
     const json = await res.json();
 
     if (!json.results || json.results.length === 0) {
         console.log(`  No TMDB results found for "${title}" (${year})`);
-        return null;
+        return { posterUrl: null, backdropUrl: null };
     }
 
     const bestMatch = json.results[0];
 
     if (!bestMatch.poster_path) {
         console.log(`  Match found for "${title}" but it has no poster image`);
-        return null;
     }
 
-    // TMDB poster paths are relative — this builds the full image URL at a good display size
-    return `https://image.tmdb.org/t/p/w500${bestMatch.poster_path}`;
+    // TMDB image paths are relative — this builds the full image URL at a good display size
+    return {
+        posterUrl: bestMatch.poster_path ? `https://image.tmdb.org/t/p/w500${bestMatch.poster_path}` : null,
+        backdropUrl: bestMatch.backdrop_path ? `https://image.tmdb.org/t/p/w1280${bestMatch.backdrop_path}` : null,
+    };
 }
 
 async function run() {
@@ -62,22 +69,26 @@ async function run() {
     for (const series of seriesList as Series[]) {
         console.log(`Searching: "${series.title}" (${series.year})`);
 
-        const posterUrl = await searchTMDBPoster(series.title, series.year);
+        const { posterUrl, backdropUrl } = await searchTMDBImages(series.title, series.year);
 
-        if (!posterUrl) {
-            console.log(`  Skipped — no poster saved for "${series.title}"\n`);
+        if (!posterUrl && !backdropUrl) {
+            console.log(`  Skipped — no images saved for "${series.title}"\n`);
             continue;
         }
 
+        const updatePayload: Record<string, string> = {};
+        if (posterUrl) updatePayload.poster_url = posterUrl;
+        if (backdropUrl) updatePayload.backdrop_url = backdropUrl;
+
         const { error: updateError } = await supabase
             .from('series')
-            .update({ poster_url: posterUrl })
+            .update(updatePayload)
             .eq('id', series.id);
 
         if (updateError) {
-            console.error(`  Failed to save poster for "${series.title}": ${updateError.message}\n`);
+            console.error(`  Failed to save images for "${series.title}": ${updateError.message}\n`);
         } else {
-            console.log(`  Saved poster: ${posterUrl}\n`);
+            console.log(`  Saved poster: ${posterUrl ?? '(none)'} | backdrop: ${backdropUrl ?? '(none)'}\n`);
         }
 
         // Small delay to stay well within TMDB's rate limits

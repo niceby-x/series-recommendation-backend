@@ -8,7 +8,12 @@ const supabase = createClient(
 
 const TMDB_TOKEN = process.env.TMDB_ACCESS_TOKEN as string;
 
-async function searchTMDBPosterNoYear(title: string): Promise<string | null> {
+interface TMDBImageUrls {
+    posterUrl: string | null;
+    backdropUrl: string | null;
+}
+
+async function searchTMDBImagesNoYear(title: string): Promise<TMDBImageUrls> {
     const url = 'https://api.themoviedb.org/3/search/tv?query=' + encodeURIComponent(title);
 
     const res = await fetch(url, {
@@ -20,24 +25,26 @@ async function searchTMDBPosterNoYear(title: string): Promise<string | null> {
 
     if (!res.ok) {
         console.error('  TMDB request failed: ' + res.status);
-        return null;
+        return { posterUrl: null, backdropUrl: null };
     }
 
     const json = await res.json();
 
     if (!json.results || json.results.length === 0) {
         console.log('  Still no results found');
-        return null;
+        return { posterUrl: null, backdropUrl: null };
     }
 
     const bestMatch = json.results[0];
 
     if (!bestMatch.poster_path) {
         console.log('  Found a match but it has no poster image');
-        return null;
     }
 
-    return 'https://image.tmdb.org/t/p/w500' + bestMatch.poster_path;
+    return {
+        posterUrl: bestMatch.poster_path ? 'https://image.tmdb.org/t/p/w500' + bestMatch.poster_path : null,
+        backdropUrl: bestMatch.backdrop_path ? 'https://image.tmdb.org/t/p/w1280' + bestMatch.backdrop_path : null,
+    };
 }
 
 async function run() {
@@ -56,22 +63,26 @@ async function run() {
     for (const series of missing) {
         console.log('Retrying: "' + series.title + '" (no year filter)');
 
-        const posterUrl = await searchTMDBPosterNoYear(series.title);
+        const { posterUrl, backdropUrl } = await searchTMDBImagesNoYear(series.title);
 
-        if (!posterUrl) {
-            console.log('  Still no poster for "' + series.title + '"\n');
+        if (!posterUrl && !backdropUrl) {
+            console.log('  Still no images for "' + series.title + '"\n');
             continue;
         }
 
+        const updatePayload: Record<string, string> = {};
+        if (posterUrl) updatePayload.poster_url = posterUrl;
+        if (backdropUrl) updatePayload.backdrop_url = backdropUrl;
+
         const { error: updateError } = await supabase
             .from('series')
-            .update({ poster_url: posterUrl })
+            .update(updatePayload)
             .eq('id', series.id);
 
         if (updateError) {
-            console.error('  Failed to save poster: ' + updateError.message + '\n');
+            console.error('  Failed to save images: ' + updateError.message + '\n');
         } else {
-            console.log('  Saved poster: ' + posterUrl + '\n');
+            console.log('  Saved poster: ' + (posterUrl ?? '(none)') + ' | backdrop: ' + (backdropUrl ?? '(none)') + '\n');
         }
 
         await new Promise((resolve) => setTimeout(resolve, 300));

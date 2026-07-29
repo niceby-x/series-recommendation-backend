@@ -62,6 +62,7 @@ async function run() {
                 episode_count: series.episode_count,
                 status: series.status,
                 poster_url: series.poster_url,
+                backdrop_url: series.backdrop_url,
                 source_keyword: 'manual-backfill',
                 review_status: 'approved',
             }]);

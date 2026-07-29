@@ -54,7 +54,12 @@ const seriesToAdd: NewSeries[] = [
       synopsis: 'Two skilled wanderers from opposing worlds join forces and grow close while chasing a legendary manual.' },
 ];
 
-async function searchTMDBPoster(title: string, year: number): Promise<string | null> {
+interface TMDBImageUrls {
+    posterUrl: string | null;
+    backdropUrl: string | null;
+}
+
+async function searchTMDBImages(title: string, year: number): Promise<TMDBImageUrls> {
     const url = 'https://api.themoviedb.org/3/search/tv?query=' + encodeURIComponent(title) + '&first_air_date_year=' + year;
 
     const res = await fetch(url, {
@@ -66,24 +71,26 @@ async function searchTMDBPoster(title: string, year: number): Promise<string | n
 
     if (!res.ok) {
         console.error('  TMDB request failed for "' + title + '": ' + res.status);
-        return null;
+        return { posterUrl: null, backdropUrl: null };
     }
 
     const json = await res.json();
 
     if (!json.results || json.results.length === 0) {
         console.log('  No TMDB results found for "' + title + '" (' + year + ')');
-        return null;
+        return { posterUrl: null, backdropUrl: null };
     }
 
     const bestMatch = json.results[0];
 
     if (!bestMatch.poster_path) {
         console.log('  Match found for "' + title + '" but it has no poster image');
-        return null;
     }
 
-    return 'https://image.tmdb.org/t/p/w500' + bestMatch.poster_path;
+    return {
+        posterUrl: bestMatch.poster_path ? 'https://image.tmdb.org/t/p/w500' + bestMatch.poster_path : null,
+        backdropUrl: bestMatch.backdrop_path ? 'https://image.tmdb.org/t/p/w1280' + bestMatch.backdrop_path : null,
+    };
 }
 
 async function run() {
@@ -103,7 +110,7 @@ async function run() {
             continue;
         }
 
-        const posterUrl = await searchTMDBPoster(series.title, series.year);
+        const { posterUrl, backdropUrl } = await searchTMDBImages(series.title, series.year);
 
         const { error: insertError } = await supabase
             .from('series')
@@ -115,12 +122,14 @@ async function run() {
                 status: series.status,
                 synopsis: series.synopsis,
                 poster_url: posterUrl,
+                backdrop_url: backdropUrl,
             }]);
 
         if (insertError) {
             console.error('  Failed to insert "' + series.title + '": ' + insertError.message + '\n');
         } else {
-            console.log('  Added with poster: ' + (posterUrl ? 'yes' : 'no poster found') + '\n');
+            console.log('  Added with poster: ' + (posterUrl ? 'yes' : 'no poster found')
+                + ', backdrop: ' + (backdropUrl ? 'yes' : 'no backdrop found') + '\n');
         }
 
         await new Promise((resolve) => setTimeout(resolve, 300));
