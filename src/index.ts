@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
+import { spawn, type ChildProcess } from 'child_process';
+import path from 'path';
 import { Series, Rating, ApiResponse } from './types';
 
 const app = express();
@@ -30,6 +32,88 @@ const supabase = createClient(
     process.env.SUPABASE_URL as string,
     process.env.SUPABASE_KEY as string
 );
+
+// In-memory state for the currently-running (or most recently run) TMDB
+// discovery import. Deliberately in-memory, not a table -- this resets if
+// the server restarts, and a run started here won't survive a host
+// restart either (the child process dies with the parent). Good enough
+// for a manually-triggered admin action; would need a real jobs table if
+// this ever needs to survive deploys or run unattended.
+interface ImportRunState {
+    running: boolean;
+    startedAt: string | null;
+    finishedAt: string | null;
+    exitCode: number | null;
+    limit: number | null;
+    logTail: string[];
+    error: string | null;
+}
+
+const MAX_IMPORT_LOG_LINES = 300;
+
+const importRunState: ImportRunState = {
+    running: false,
+    startedAt: null,
+    finishedAt: null,
+    exitCode: null,
+    limit: null,
+    logTail: [],
+    error: null,
+};
+
+let importChild: ChildProcess | null = null;
+
+function appendImportLog(chunk: string) {
+    const lines = chunk.toString().split('\n').filter((l) => l.trim().length > 0);
+    importRunState.logTail.push(...lines);
+    if (importRunState.logTail.length > MAX_IMPORT_LOG_LINES) {
+        importRunState.logTail = importRunState.logTail.slice(-MAX_IMPORT_LOG_LINES);
+    }
+}
+
+// Spawns discover-series-by-keyword.ts as its own process rather than
+// importing and calling it inline -- the script is a standalone CLI tool
+// (reads --limit from argv, runs to completion, exits) built and tested on
+// its own, and a real run can take minutes. Running it inline inside this
+// request handler would block the whole API server and blow past any
+// HTTP/proxy timeout long before it finished. Mirrors how this file itself
+// is currently being executed (tsx in dev, compiled node in a `tsc` build)
+// so it works the same way in both environments without a separate flag.
+function startImportRun(limit: number) {
+    const runningCompiled = __filename.endsWith('.js');
+    const scriptPath = path.join(__dirname, runningCompiled ? 'discover-series-by-keyword.js' : 'discover-series-by-keyword.ts');
+    const command = runningCompiled ? 'node' : 'npx';
+    const args = runningCompiled ? [scriptPath, '--limit=' + limit] : ['tsx', scriptPath, '--limit=' + limit];
+
+    importRunState.running = true;
+    importRunState.startedAt = new Date().toISOString();
+    importRunState.finishedAt = null;
+    importRunState.exitCode = null;
+    importRunState.limit = limit;
+    importRunState.logTail = [];
+    importRunState.error = null;
+
+    importChild = spawn(command, args, {
+        cwd: path.resolve(__dirname, '..'),
+        env: process.env,
+    });
+
+    importChild.stdout?.on('data', (data) => appendImportLog(data.toString()));
+    importChild.stderr?.on('data', (data) => appendImportLog(data.toString()));
+
+    importChild.on('error', (err) => {
+        importRunState.error = err.message;
+        importRunState.running = false;
+        importRunState.finishedAt = new Date().toISOString();
+    });
+
+    importChild.on('close', (code) => {
+        importRunState.running = false;
+        importRunState.finishedAt = new Date().toISOString();
+        importRunState.exitCode = code;
+        importChild = null;
+    });
+}
 
 //ROUTE 1 - Welcome route
 app.get('/', (req: Request, res: Response) => {
@@ -770,6 +854,131 @@ app.post('/admin/candidates/:id/restore', async (req: Request, res: Response) =>
     }
 
     res.status(200).json({ message: 'Restored to pending' });
+});
+
+// Route 13 - List registered users with their activity counts (admin only).
+// Ratings/watchlist counts are computed in-memory from the raw user_id
+// columns rather than a Postgres GROUP BY -- simplest thing that works
+// correctly at this app's current scale, no RPC/view needed. If the users
+// table grows large enough for this to matter, switch to a `.rpc()` call
+// against a SQL aggregate instead of adding pagination band-aids here.
+app.get('/admin/users', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const [usersRes, ratingsRes, listsRes] = await Promise.all([
+        supabase.from('users').select('id, email, username, created_at').order('created_at', { ascending: false }),
+        supabase.from('ratings').select('user_id'),
+        supabase.from('user_lists').select('user_id'),
+    ]);
+
+    if (usersRes.error) return res.status(500).json({ message: usersRes.error.message });
+    if (ratingsRes.error) return res.status(500).json({ message: ratingsRes.error.message });
+    if (listsRes.error) return res.status(500).json({ message: listsRes.error.message });
+
+    const ratingsCountByUser = new Map<number, number>();
+    for (const row of ratingsRes.data) {
+        ratingsCountByUser.set(row.user_id, (ratingsCountByUser.get(row.user_id) || 0) + 1);
+    }
+
+    const watchlistCountByUser = new Map<number, number>();
+    for (const row of listsRes.data) {
+        watchlistCountByUser.set(row.user_id, (watchlistCountByUser.get(row.user_id) || 0) + 1);
+    }
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+
+    const data = usersRes.data.map((u) => ({
+        ...u,
+        ratings_count: ratingsCountByUser.get(u.id) || 0,
+        watchlist_count: watchlistCountByUser.get(u.id) || 0,
+        is_admin: !!adminEmail && u.email === adminEmail,
+    }));
+
+    res.json({
+        message: 'Users',
+        count: data.length,
+        data
+    });
+});
+
+// Route 14 - List every rating/review across all series (admin only).
+// Reviews aren't shown anywhere on the public site yet (no display feature
+// built), but people can already submit review_text via POST /ratings --
+// this gives admins visibility into what's been written, and a way to
+// remove anything inappropriate, before public display ever ships.
+// Ordered by id descending (a safe recency proxy regardless of whether
+// this table happens to have a created_at column).
+app.get('/admin/reviews', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { data, error } = await supabase
+        .from('ratings')
+        .select('*, users (username, email), series (id, title, poster_url)')
+        .order('id', { ascending: false });
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({
+        message: 'Reviews',
+        count: data.length,
+        data
+    });
+});
+
+// Route 15 - Remove a rating/review (admin only). Deletes the whole row --
+// score included -- rather than just blanking review_text, so a removed
+// review doesn't leave a scoreless rating with no explanation behind it.
+app.delete('/admin/reviews/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { error } = await supabase
+        .from('ratings')
+        .delete()
+        .eq('id', id);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(200).json({ message: 'Review removed' });
+});
+
+// Route 16 - Trigger a new TMDB discovery run (admin only). Only one run
+// at a time -- concurrent runs would double-queue candidates and fight
+// over TMDB's rate limit -- so this 409s if one's already in progress
+// instead of silently starting a second. Returns immediately; poll
+// GET /admin/import/status for progress and the tail of its log output.
+app.post('/admin/import/run', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    if (importRunState.running) {
+        return res.status(409).json({ message: 'An import is already running.' });
+    }
+
+    const limitInput = parseInt(req.body?.limit);
+    const limit = Number.isFinite(limitInput) && limitInput > 0 ? limitInput : 150;
+
+    startImportRun(limit);
+
+    res.status(202).json({ message: 'Import started', limit });
+});
+
+// Route 17 - Poll the status and log tail of the current (or most recent)
+// discovery run (admin only). This state is in-memory only -- see the
+// ImportRunState comment above -- so it resets on server restart.
+app.get('/admin/import/status', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    res.json({ message: 'Import status', ...importRunState });
 });
 
 app.listen(PORT, () => {
