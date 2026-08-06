@@ -347,12 +347,27 @@ async function requireAdmin(req: Request, res: Response): Promise<boolean> {
 
     const adminEmail = process.env.ADMIN_EMAIL;
 
-    if (!adminEmail || authUser.email !== adminEmail) {
-        res.status(403).json({ message: 'Admin access required.' });
-        return false;
+    // ADMIN_EMAIL is the permanent root admin -- always allowed, can't be
+    // revoked through the app itself (see the users.is_admin routes below).
+    if (!!adminEmail && authUser.email === adminEmail) {
+        return true;
     }
 
-    return true;
+    // Beyond the root admin, promoted admins are tracked in users.is_admin
+    // (see /admin/users/:id/admin) rather than a second env var, so more
+    // than one person can administer the site.
+    const { data: userRow } = await supabase
+        .from('users')
+        .select('is_admin')
+        .eq('auth_id', authUser.id)
+        .maybeSingle();
+
+    if (userRow?.is_admin) {
+        return true;
+    }
+
+    res.status(403).json({ message: 'Admin access required.' });
+    return false;
 }
 
 // Route 4 - Submit a rating
@@ -579,18 +594,28 @@ app.get('/admin/candidates/counts', async (req: Request, res: Response) => {
     });
 });
 
-// Route 9c - Get all active taxonomy tags, grouped by dimension (admin only).
-// Fetched once by the admin page on load, not per candidate row.
+// Route 9c - Get taxonomy tags, grouped by dimension (admin only). By
+// default only active tags (used by the candidates taxonomy picker, which
+// shouldn't offer retired tags) -- pass ?all=true to also include inactive
+// ones (used by the tag management page, which needs to show and re-
+// activate them).
 app.get('/admin/tags', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const { data, error } = await supabase
+    const includeInactive = req.query.all === 'true';
+
+    let query = supabase
         .from('tags')
-        .select('id, dimension, value_key, display_label, display_emoji, sort_order')
-        .eq('is_active', true)
+        .select('id, dimension, value_key, display_label, display_emoji, sort_order, is_active')
         .order('dimension', { ascending: true })
         .order('sort_order', { ascending: true });
+
+    if (!includeInactive) {
+        query = query.eq('is_active', true);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
         return res.status(500).json({ message: error.message });
@@ -603,6 +628,93 @@ app.get('/admin/tags', async (req: Request, res: Response) => {
     }
 
     res.json({ message: 'Tags by dimension', data: grouped });
+});
+
+// Route 9c-1 - Create a new taxonomy tag (admin only). value_key is derived
+// from display_label (lowercased, non-alphanumeric -> underscore) rather
+// than accepted from the client, so it can't collide or drift from what's
+// shown in the UI. sort_order places new tags after whatever already
+// exists in that dimension.
+app.post('/admin/tags', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { dimension, display_label, display_emoji } = req.body || {};
+
+    if (!dimension || !display_label) {
+        return res.status(400).json({ message: 'dimension and display_label are required.' });
+    }
+
+    const value_key = String(display_label)
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '');
+
+    if (!value_key) {
+        return res.status(400).json({ message: 'display_label must contain at least one letter or number.' });
+    }
+
+    const { count } = await supabase
+        .from('tags')
+        .select('id', { count: 'exact', head: true })
+        .eq('dimension', dimension);
+
+    const { data, error } = await supabase
+        .from('tags')
+        .insert([{
+            dimension,
+            value_key,
+            display_label,
+            display_emoji: display_emoji || null,
+            sort_order: count || 0,
+            is_active: true,
+        }])
+        .select('id, dimension, value_key, display_label, display_emoji, sort_order, is_active')
+        .single();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(201).json({ message: 'Tag created', data });
+});
+
+// Route 9c-2 - Toggle a tag active/inactive (admin only). Tags are never
+// hard-deleted -- deactivating just hides them from the candidate taxonomy
+// picker and /admin/tags' default (active-only) response, without breaking
+// series/candidates that already reference the tag id.
+app.patch('/admin/tags/:id/toggle', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { data: existing, error: fetchError } = await supabase
+        .from('tags')
+        .select('is_active')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (fetchError) {
+        return res.status(500).json({ message: fetchError.message });
+    }
+    if (!existing) {
+        return res.status(404).json({ message: 'Tag not found.' });
+    }
+
+    const { data, error } = await supabase
+        .from('tags')
+        .update({ is_active: !existing.is_active })
+        .eq('id', id)
+        .select('id, dimension, value_key, display_label, display_emoji, sort_order, is_active')
+        .single();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({ message: 'Tag updated', data });
 });
 
 // Route 9d - Save a candidate's taxonomy (Curated Attributes + Discovery Tags) (admin only).
@@ -969,7 +1081,7 @@ app.get('/admin/users', async (req: Request, res: Response) => {
     if (!isAdmin) return;
 
     const [usersRes, ratingsRes, listsRes] = await Promise.all([
-        supabase.from('users').select('id, email, username, created_at').order('created_at', { ascending: false }),
+        supabase.from('users').select('id, auth_id, email, username, created_at, is_admin, is_banned').order('created_at', { ascending: false }),
         supabase.from('ratings').select('user_id'),
         supabase.from('user_lists').select('user_id'),
     ]);
@@ -990,18 +1102,153 @@ app.get('/admin/users', async (req: Request, res: Response) => {
 
     const adminEmail = process.env.ADMIN_EMAIL;
 
-    const data = usersRes.data.map((u) => ({
-        ...u,
-        ratings_count: ratingsCountByUser.get(u.id) || 0,
-        watchlist_count: watchlistCountByUser.get(u.id) || 0,
-        is_admin: !!adminEmail && u.email === adminEmail,
-    }));
+    // is_root: the permanent ADMIN_EMAIL account -- the frontend uses this
+    // to disable ban/demote/delete on it, since those routes reject it
+    // server-side anyway (see below) but shouldn't even look clickable.
+    // is_admin: true for the root account OR anyone promoted via
+    // /admin/users/:id/admin (the users.is_admin column).
+    const data = usersRes.data.map((u) => {
+        const isRoot = !!adminEmail && u.email === adminEmail;
+        return {
+            ...u,
+            ratings_count: ratingsCountByUser.get(u.id) || 0,
+            watchlist_count: watchlistCountByUser.get(u.id) || 0,
+            is_admin: isRoot || !!u.is_admin,
+            is_banned: !!u.is_banned,
+            is_root: isRoot,
+        };
+    });
 
     res.json({
         message: 'Users',
         count: data.length,
         data
     });
+});
+
+// Route 13a - Promote or demote a user's admin access (admin only). Only
+// touches users.is_admin -- the ADMIN_EMAIL account itself is the
+// permanent root admin and can't be changed through this route, so there's
+// always at least one admin no matter what happens here.
+app.patch('/admin/users/:id/admin', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const isAdminDesired = !!req.body?.is_admin;
+
+    const { data: target, error: targetError } = await supabase
+        .from('users')
+        .select('id, email')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (targetError) return res.status(500).json({ message: targetError.message });
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+    if (!!adminEmail && target.email === adminEmail) {
+        return res.status(400).json({ message: 'This account is the permanent admin and can\'t be changed here.' });
+    }
+
+    const { data, error } = await supabase
+        .from('users')
+        .update({ is_admin: isAdminDesired })
+        .eq('id', id)
+        .select('id, email, username, created_at, is_admin, is_banned')
+        .single();
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: isAdminDesired ? 'User promoted to admin' : 'User demoted', data: { ...data, is_root: false } });
+});
+
+// Route 13b - Ban or unban a user (admin only). Bans through Supabase
+// Auth itself (ban_duration), not just a cosmetic flag on the users row --
+// a banned user's session is actually rejected by Supabase on their next
+// request, not merely hidden from admin views. users.is_banned mirrors
+// the real state so the list doesn't need a second round-trip to show it.
+app.patch('/admin/users/:id/ban', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const isBannedDesired = !!req.body?.is_banned;
+
+    const { data: target, error: targetError } = await supabase
+        .from('users')
+        .select('id, email, auth_id')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (targetError) return res.status(500).json({ message: targetError.message });
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+    if (!!adminEmail && target.email === adminEmail) {
+        return res.status(400).json({ message: 'The permanent admin account can\'t be banned.' });
+    }
+
+    // ~100 years -- Supabase's ban_duration has no literal "forever", so
+    // this is the conventional stand-in; 'none' lifts it immediately.
+    const { error: authBanError } = await supabase.auth.admin.updateUserById(target.auth_id, {
+        ban_duration: isBannedDesired ? '876000h' : 'none',
+    });
+
+    if (authBanError) return res.status(500).json({ message: authBanError.message });
+
+    const { data, error } = await supabase
+        .from('users')
+        .update({ is_banned: isBannedDesired })
+        .eq('id', id)
+        .select('id, email, username, created_at, is_admin, is_banned')
+        .single();
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: isBannedDesired ? 'User banned' : 'User unbanned', data: { ...data, is_root: false } });
+});
+
+// Route 13c - Permanently delete a user (admin only). Removes the real
+// Supabase Auth account (auth.admin.deleteUser) so they can't sign in
+// again at all, not just lose their app-level row -- plus every table
+// that references user_id, same defensive cleanup-before-delete pattern
+// as DELETE /admin/series/:id. Auth deletion happens before the app-level
+// cleanup: if it fails, nothing else is touched and the account is
+// unchanged rather than left in a half-deleted state.
+app.delete('/admin/users/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { data: target, error: targetError } = await supabase
+        .from('users')
+        .select('id, email, auth_id')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (targetError) return res.status(500).json({ message: targetError.message });
+    if (!target) return res.status(404).json({ message: 'User not found.' });
+
+    const adminEmail = process.env.ADMIN_EMAIL;
+    if (!!adminEmail && target.email === adminEmail) {
+        return res.status(400).json({ message: 'The permanent admin account can\'t be deleted.' });
+    }
+
+    const { error: authDeleteError } = await supabase.auth.admin.deleteUser(target.auth_id);
+    if (authDeleteError) return res.status(500).json({ message: authDeleteError.message });
+
+    const { error: ratingsError } = await supabase.from('ratings').delete().eq('user_id', id);
+    if (ratingsError) return res.status(500).json({ message: ratingsError.message });
+
+    const { error: listsError } = await supabase.from('user_lists').delete().eq('user_id', id);
+    if (listsError) return res.status(500).json({ message: listsError.message });
+
+    const { error: userError } = await supabase.from('users').delete().eq('id', id);
+    if (userError) return res.status(500).json({ message: userError.message });
+
+    res.json({ message: 'User deleted' });
 });
 
 // Route 14 - List every rating/review across all series (admin only).
