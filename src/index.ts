@@ -244,15 +244,17 @@ app.get('/series', async (req: Request, res: Response) => {
 app.get('/series/:id', async (req: Request, res: Response) => {
     const id = parseInt(req.params.id as string);
 
+    // Genres joined in and flattened to a plain genre_names array (same
+    // flattening approach as GET /admin/candidates does for tag_ids) --
+    // previously this route returned no genre info at all, so nothing
+    // in the app (including this endpoint's own consumers) could show a
+    // series' genres. Purely additive: existing consumers that don't
+    // read genre_names are unaffected.
     const { data, error } = await supabase
         .from('series')
-        .select('*')
+        .select('*, series_genres (genres (name))')
         .eq('id', id)
         .single();
-
-    console.log("id:", id);
-    console.log("data:", data);
-    console.log("error:", error);
 
     if (error) {
         return res.status(404).json({
@@ -261,9 +263,12 @@ app.get('/series/:id', async (req: Request, res: Response) => {
         });
     }
 
+    const { series_genres, ...rest } = data as any;
+    const genre_names = (series_genres || []).map((row: any) => row.genres?.name).filter(Boolean);
+
     res.json({
         message: "Success",
-        data
+        data: { ...rest, genre_names }
     });
 });
 
@@ -1107,6 +1112,142 @@ app.get('/admin/import/status', async (req: Request, res: Response) => {
         error: lastRun.error_message,
         interrupted: lastRun.status === 'interrupted',
     });
+});
+
+// Route 18 - Edit a published series (admin only). Unlike candidate
+// approval's `overrides`, this mutates a LIVE row directly -- there was
+// previously no way to fix a typo, swap a wrong poster, or correct a
+// field on anything already published. Every field is optional (only
+// what's sent gets updated); genre_names, if present, is the COMPLETE
+// desired genre list and gets diffed against what's currently linked
+// (find-or-create each, same pattern as the approve route), not appended.
+app.patch('/admin/series/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const body = req.body || {};
+
+    const editableFields = [
+        'title', 'original_title', 'synopsis', 'country', 'year', 'episode_count', 'status',
+        'poster_url', 'backdrop_url', 'romance_pace', 'emotional_intensity', 'ending_type', 'content_level',
+    ] as const;
+
+    const update: Record<string, unknown> = {};
+    for (const field of editableFields) {
+        if (body[field] !== undefined) update[field] = body[field];
+    }
+
+    if (Object.keys(update).length > 0) {
+        const { error: updateError } = await supabase
+            .from('series')
+            .update(update)
+            .eq('id', id);
+
+        if (updateError) {
+            return res.status(500).json({ message: updateError.message });
+        }
+    }
+
+    // Genre reassignment: find-or-create each named genre, then diff against
+    // what's currently linked so this can both add and remove genres from an
+    // existing series (not just append).
+    if (Array.isArray(body.genre_names)) {
+        const { data: existingLinks, error: existingLinksError } = await supabase
+            .from('series_genres')
+            .select('genre_id, genres (name)')
+            .eq('series_id', id);
+
+        if (existingLinksError) {
+            return res.status(500).json({ message: existingLinksError.message });
+        }
+
+        const currentNames = new Set(
+            (existingLinks || []).map((row: any) => row.genres?.name).filter(Boolean)
+        );
+        const desiredNames = new Set((body.genre_names as string[]).filter(Boolean));
+
+        const namesToAdd = [...desiredNames].filter((name) => !currentNames.has(name));
+        const linksToRemove = (existingLinks || []).filter(
+            (row: any) => row.genres?.name && !desiredNames.has(row.genres.name)
+        );
+
+        for (const genreName of namesToAdd) {
+            const { data: existingGenre } = await supabase
+                .from('genres')
+                .select('id')
+                .eq('name', genreName)
+                .maybeSingle();
+
+            let genreId = existingGenre?.id;
+
+            if (!genreId) {
+                const { data: createdGenre, error: genreError } = await supabase
+                    .from('genres')
+                    .insert([{ name: genreName }])
+                    .select('id')
+                    .single();
+
+                if (genreError || !createdGenre) {
+                    console.error('Failed to create genre "' + genreName + '": ' + genreError?.message);
+                    continue;
+                }
+                genreId = createdGenre.id;
+            }
+
+            const { error: linkError } = await supabase
+                .from('series_genres')
+                .insert([{ series_id: id, genre_id: genreId }]);
+
+            if (linkError) {
+                console.error('Failed to link genre "' + genreName + '": ' + linkError.message);
+            }
+        }
+
+        for (const row of linksToRemove as any[]) {
+            const { error: unlinkError } = await supabase
+                .from('series_genres')
+                .delete()
+                .eq('series_id', id)
+                .eq('genre_id', row.genre_id);
+
+            if (unlinkError) {
+                console.error('Failed to unlink genre id ' + row.genre_id + ': ' + unlinkError.message);
+            }
+        }
+    }
+
+    res.status(200).json({ message: 'Series updated' });
+});
+
+// Route 19 - Permanently remove a published series (admin only). Cleans up
+// every table that references series_id first -- link tables plus
+// ratings/watchlist entries real users may have created -- rather than
+// relying on ON DELETE CASCADE being configured (same caution as the
+// candidate restore route above), so this can't fail partway with orphaned
+// rows left behind or a foreign-key error on the final delete.
+app.delete('/admin/series/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists'];
+
+    for (const table of cleanupTables) {
+        const { error } = await supabase.from(table).delete().eq('series_id', id);
+        if (error) {
+            return res.status(500).json({ message: 'Failed to clean up ' + table + ': ' + error.message });
+        }
+    }
+
+    const { error: deleteError } = await supabase.from('series').delete().eq('id', id);
+
+    if (deleteError) {
+        return res.status(500).json({ message: deleteError.message });
+    }
+
+    res.status(200).json({ message: 'Series deleted' });
 });
 
 app.listen(PORT, () => {
