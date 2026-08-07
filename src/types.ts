@@ -6,6 +6,14 @@
 // src/index.ts's /admin/candidates/:id/approve handler for the full insert
 // shape). Only adding backdrop_url here for now since that's what's in
 // scope; the rest were already out of sync before this change.
+export interface SeriesTag {
+    id: number;
+    dimension: "mood" | "trope" | "relationship_dynamic" | "theme" | "content_warning";
+    value_key: string;
+    display_label: string;
+    display_emoji: string | null;
+}
+
 export interface Series {
     id: number;
     title: string;
@@ -18,6 +26,11 @@ export interface Series {
     poster_url: string | null;
     backdrop_url: string | null;
     created_at: string;
+    // Join results, not real columns -- present on GET /series and
+    // GET /series/:id responses (see the series_tags join in src/index.ts),
+    // not on a raw row from `series` itself.
+    tags?: SeriesTag[];
+    tag_ids?: number[];
 }
 
 export interface Rating {

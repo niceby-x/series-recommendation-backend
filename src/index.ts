@@ -222,19 +222,32 @@ app.get('/', (req: Request, res: Response) => {
 });
 
 //Route 2 - Get ALL series
+// series_tags -> tags joined in and flattened to a plain `tags` array per
+// row (same flatten-the-join-table approach as the genre join below and
+// the candidate tag_ids flattening) -- previously this route returned no
+// mood/trope/etc. info at all, so the Moods and Tropes pages had nothing
+// real to match series against and fell back to purely positional mock
+// data. Purely additive: existing consumers that don't read `tags` are
+// unaffected.
 app.get('/series', async (req: Request, res: Response) => {
     const { data, error } = await supabase
     .from('series')
-    .select('*');
+    .select('*, series_tags (tags (id, dimension, value_key, display_label, display_emoji))');
 
     if (error) {
         return res.status(500).json({ message: error.message});
     }
 
+    const flattened = data.map((row: any) => {
+        const { series_tags, ...rest } = row;
+        const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
+        return { ...rest, tags };
+    });
+
     const response: ApiResponse<Series[]> = {
         message: 'List of BL Series',
-        count: data.length,
-        data: data
+        count: flattened.length,
+        data: flattened
     };
 
     res.json(response);
@@ -250,9 +263,16 @@ app.get('/series/:id', async (req: Request, res: Response) => {
     // in the app (including this endpoint's own consumers) could show a
     // series' genres. Purely additive: existing consumers that don't
     // read genre_names are unaffected.
+    //
+    // series_tags -> tags is joined the same way, exposed both as the full
+    // `tags` objects (dimension/value_key/display_label/display_emoji, for
+    // rendering on the public detail page) and as a flat `tag_ids` array
+    // (mirrors series_candidates' tag_ids shape) so SeriesEditModal's tag
+    // picker can reuse the exact same selected-ids-as-a-Set pattern the
+    // candidates Taxonomy modal already uses.
     const { data, error } = await supabase
         .from('series')
-        .select('*, series_genres (genres (name))')
+        .select('*, series_genres (genres (name)), series_tags (tags (id, dimension, value_key, display_label, display_emoji))')
         .eq('id', id)
         .single();
 
@@ -263,12 +283,14 @@ app.get('/series/:id', async (req: Request, res: Response) => {
         });
     }
 
-    const { series_genres, ...rest } = data as any;
+    const { series_genres, series_tags, ...rest } = data as any;
     const genre_names = (series_genres || []).map((row: any) => row.genres?.name).filter(Boolean);
+    const tags = (series_tags || []).map((row: any) => row.tags).filter(Boolean);
+    const tag_ids = tags.map((t: any) => t.id);
 
     res.json({
         message: "Success",
-        data: { ...rest, genre_names }
+        data: { ...rest, genre_names, tags, tag_ids }
     });
 });
 
@@ -1756,6 +1778,51 @@ app.patch('/admin/series/:id', async (req: Request, res: Response) => {
 
         if (updateError) {
             return res.status(500).json({ message: updateError.message });
+        }
+    }
+
+    // Tag reassignment (mood/trope/relationship_dynamic/theme/content_warning):
+    // unlike genres this points straight into the shared `tags` table by id,
+    // so it's a diff-and-repoint rather than a find-or-create -- identical
+    // logic to PATCH /admin/candidates/:id/taxonomy's tag_ids handling, just
+    // against series_tags instead of series_candidate_tags. tag_ids, if
+    // present, is the COMPLETE desired set across all dimensions.
+    if (Array.isArray(body.tag_ids)) {
+        const { data: existingTagLinks, error: fetchTagsError } = await supabase
+            .from('series_tags')
+            .select('tag_id')
+            .eq('series_id', id);
+
+        if (fetchTagsError) {
+            return res.status(500).json({ message: fetchTagsError.message });
+        }
+
+        const existingTagIds = new Set((existingTagLinks || []).map((row) => row.tag_id));
+        const desiredTagIds = new Set(body.tag_ids as number[]);
+
+        const tagsToInsert = (body.tag_ids as number[]).filter((tagId) => !existingTagIds.has(tagId));
+        const tagsToDelete = [...existingTagIds].filter((tagId) => !desiredTagIds.has(tagId));
+
+        if (tagsToInsert.length > 0) {
+            const { error: insertTagsError } = await supabase
+                .from('series_tags')
+                .insert(tagsToInsert.map((tagId) => ({ series_id: id, tag_id: tagId })));
+
+            if (insertTagsError) {
+                return res.status(500).json({ message: insertTagsError.message });
+            }
+        }
+
+        if (tagsToDelete.length > 0) {
+            const { error: deleteTagsError } = await supabase
+                .from('series_tags')
+                .delete()
+                .eq('series_id', id)
+                .in('tag_id', tagsToDelete);
+
+            if (deleteTagsError) {
+                return res.status(500).json({ message: deleteTagsError.message });
+            }
         }
     }
 
