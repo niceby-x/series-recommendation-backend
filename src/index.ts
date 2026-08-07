@@ -1927,6 +1927,197 @@ app.delete('/admin/series/:id', async (req: Request, res: Response) => {
     res.status(200).json({ message: 'Series deleted' });
 });
 
+// Shared shape-builder for curator picks -- both the public and admin
+// routes below join the same series/genre/tags data, so this keeps that
+// one join/flatten in one place instead of duplicated inline twice.
+async function fetchCuratorPicksJoined() {
+    const { data, error } = await supabase
+        .from('curator_picks')
+        .select(
+            'id, blurb, is_feature, sort_order, series (id, title, country, year, poster_url, backdrop_url, ' +
+            'series_genres (genres (name)), series_tags (tags (display_label)))'
+        )
+        .order('is_feature', { ascending: false })
+        .order('sort_order', { ascending: true });
+
+    if (error || !data) return { error, data: [] as any[] };
+
+    const seriesIds = data.map((p: any) => p.series?.id).filter(Boolean);
+
+    // Real average rating per picked series, computed from actual
+    // `ratings` rows -- these are meant to be genuinely featured titles
+    // now, so this uses the real number instead of the deterministic mock
+    // rating helper the rest of the catalog UI falls back to.
+    const ratingsBySeries = new Map<number, number[]>();
+    if (seriesIds.length > 0) {
+        const { data: ratingsRows } = await supabase.from('ratings').select('series_id, score').in('series_id', seriesIds);
+        for (const row of ratingsRows || []) {
+            const list = ratingsBySeries.get(row.series_id) || [];
+            list.push(row.score);
+            ratingsBySeries.set(row.series_id, list);
+        }
+    }
+
+    const shaped = data
+        .filter((p: any) => p.series)
+        .map((p: any) => {
+            const scores = ratingsBySeries.get(p.series.id) || [];
+            const avgRating = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+            // Real mood/trope tags if the series has any (series_tags),
+            // otherwise fall back to genre names -- better than an empty
+            // chip row for a series that's been genre-tagged but not yet
+            // run through the newer tags picker in SeriesEditModal.
+            const realTags = (p.series.series_tags || []).map((row: any) => row.tags?.display_label).filter(Boolean);
+            const genreNames = (p.series.series_genres || []).map((row: any) => row.genres?.name).filter(Boolean);
+            return {
+                id: p.series.id,
+                pick_id: p.id,
+                title: p.series.title,
+                country: p.series.country,
+                mediaType: 'Series',
+                year: p.series.year,
+                rating: avgRating,
+                tags: realTags.length > 0 ? realTags : genreNames,
+                imageUrl: p.series.backdrop_url ?? p.series.poster_url,
+                isFeature: p.is_feature,
+                blurb: p.blurb,
+            };
+        });
+
+    return { error: null, data: shaped };
+}
+
+// Route 20 - Public: today's curator picks (feature + list), for the
+// homepage's Curator's Picks section. No auth required -- this is
+// display data, same as GET /series. Replaces the old
+// allSeries.slice(6, 10)-with-fake-tags placeholder in
+// HomeLanding.tsx/HomeAuthed.tsx; falls back to their existing mock
+// content on the frontend side if this list is empty (no picks curated
+// yet), same real-first-then-mock convention as everywhere else.
+app.get('/curator-picks', async (req: Request, res: Response) => {
+    const { error, data } = await fetchCuratorPicksJoined();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({ message: 'Curator picks', data });
+});
+
+// Route 21 - Admin: same data as above, for the management screen
+// (app/admin/curator-picks/page.tsx). No separate active/inactive
+// distinction like tags/genres have -- a curator pick either exists (and
+// shows on the homepage) or it's been removed, there's no soft-delete
+// state for these.
+app.get('/admin/curator-picks', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { error, data } = await fetchCuratorPicksJoined();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({ message: 'Curator picks', data });
+});
+
+// Route 22 - Add a series to Curator Picks (admin only). Body:
+// { series_id, blurb?, is_feature? }. Only one pick can be the feature at
+// a time -- see the invariant note on Route 23 -- so is_feature: true here
+// unsets it on every other row first.
+app.post('/admin/curator-picks', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { series_id, blurb, is_feature } = req.body || {};
+
+    if (!series_id) {
+        return res.status(400).json({ message: 'series_id is required.' });
+    }
+
+    if (is_feature) {
+        await supabase.from('curator_picks').update({ is_feature: false }).eq('is_feature', true);
+    }
+
+    let nextSortOrder = 0;
+    const { data: existing } = await supabase
+        .from('curator_picks')
+        .select('sort_order')
+        .order('sort_order', { ascending: false })
+        .limit(1);
+    if (existing && existing.length > 0) nextSortOrder = existing[0].sort_order + 1;
+
+    const { data, error } = await supabase
+        .from('curator_picks')
+        .insert({ series_id, blurb: blurb || null, is_feature: !!is_feature, sort_order: nextSortOrder })
+        .select()
+        .single();
+
+    if (error) {
+        if (error.code === '23505') {
+            return res.status(409).json({ message: 'That series is already a curator pick.' });
+        }
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(201).json({ message: 'Curator pick added', data });
+});
+
+// Route 23 - Edit a curator pick's blurb/feature state/order (admin only).
+// Body: any of { blurb, is_feature, sort_order }. is_feature is a single-
+// row invariant across the whole table (there's exactly one Feature card
+// on the homepage) -- setting it true here unsets it everywhere else
+// first, in the same request, so there's never a moment with two (or
+// zero, if you just wanted to swap which one) featured rows from the
+// caller's point of view.
+app.patch('/admin/curator-picks/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const { blurb, is_feature, sort_order } = req.body || {};
+
+    if (is_feature === true) {
+        await supabase.from('curator_picks').update({ is_feature: false }).eq('is_feature', true).neq('id', id);
+    }
+
+    const updates: Record<string, unknown> = {};
+    if (blurb !== undefined) updates.blurb = blurb;
+    if (is_feature !== undefined) updates.is_feature = is_feature;
+    if (sort_order !== undefined) updates.sort_order = sort_order;
+
+    const { data, error } = await supabase
+        .from('curator_picks')
+        .update(updates)
+        .eq('id', id)
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({ message: 'Curator pick updated', data });
+});
+
+// Route 24 - Remove a series from Curator Picks (admin only). Does not
+// touch the series itself -- this only un-features it.
+app.delete('/admin/curator-picks/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { error } = await supabase.from('curator_picks').delete().eq('id', id);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(200).json({ message: 'Curator pick removed' });
+});
+
 app.listen(PORT, () => {
     console.log(`BL Series API is running at http://localhost:${PORT}`);
     reconcileOrphanedImportRun();
