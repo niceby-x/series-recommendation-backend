@@ -752,6 +752,317 @@ app.patch('/admin/tags/:id/toggle', async (req: Request, res: Response) => {
     res.json({ message: data.is_active ? 'Tag activated' : 'Tag deactivated', data });
 });
 
+// Route 9c-1 - Rename a tag (admin only). Only display_label/display_emoji
+// change -- value_key stays put, since nothing outside this row references
+// it by string (series_tags/series_candidate_tags point at the numeric
+// id), so there's no reason to risk drifting it from what the tag was
+// created with. Rejects a rename that would collide (case-insensitively)
+// with another tag already in the same dimension -- that's a merge, not a
+// rename, and silently combining them would lose one tag's history of
+// which series it was actually on.
+app.patch('/admin/tags/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const { display_label, display_emoji } = req.body || {};
+
+    if (!display_label || !String(display_label).trim()) {
+        return res.status(400).json({ message: 'display_label is required.' });
+    }
+
+    const { data: existing, error: fetchError } = await supabase
+        .from('tags')
+        .select('id, dimension')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (fetchError) return res.status(500).json({ message: fetchError.message });
+    if (!existing) return res.status(404).json({ message: 'Tag not found.' });
+
+    const { data: siblings, error: siblingsError } = await supabase
+        .from('tags')
+        .select('id, display_label')
+        .eq('dimension', existing.dimension)
+        .neq('id', id);
+
+    if (siblingsError) return res.status(500).json({ message: siblingsError.message });
+
+    const collision = (siblings || []).find(
+        (t) => t.display_label.trim().toLowerCase() === String(display_label).trim().toLowerCase()
+    );
+    if (collision) {
+        return res.status(409).json({
+            message: '"' + display_label + '" already exists in this dimension (id ' + collision.id + '). Merge into it instead of renaming.',
+        });
+    }
+
+    const { data, error } = await supabase
+        .from('tags')
+        .update({ display_label, display_emoji: display_emoji || null })
+        .eq('id', id)
+        .select('id, dimension, value_key, display_label, display_emoji, sort_order, is_active')
+        .single();
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: 'Tag renamed', data });
+});
+
+// Route 9c-2 - Merge one or more tags into another (admin only), fixing
+// duplicates like "Enemies to Lovers" existing as two separate rows.
+// Repoints every series_tags/series_candidate_tags row that pointed at a
+// source tag onto the target instead (skipping any series/candidate that's
+// already linked to the target, so merging can't create a duplicate link),
+// then deletes the source tag rows. Body: { source_ids: number[], target_id }.
+// All tags involved must share a dimension -- merging "Angsty" (mood) into
+// "Slow Burn" (trope) would silently misclassify every series that carried
+// the source tag, which is a bigger problem than the duplicate it fixes.
+app.post('/admin/tags/merge', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const targetId = parseInt(req.body?.target_id);
+    const sourceIds: number[] = (req.body?.source_ids || [])
+        .map((id: unknown) => parseInt(String(id)))
+        .filter((id: number) => !Number.isNaN(id) && id !== targetId);
+
+    if (!targetId || sourceIds.length === 0) {
+        return res.status(400).json({ message: 'target_id and at least one distinct source_id are required.' });
+    }
+
+    const { data: involved, error: involvedError } = await supabase
+        .from('tags')
+        .select('id, dimension')
+        .in('id', [targetId, ...sourceIds]);
+
+    if (involvedError) return res.status(500).json({ message: involvedError.message });
+    if (!involved || involved.length !== sourceIds.length + 1) {
+        return res.status(404).json({ message: 'One or more tags were not found.' });
+    }
+    if (new Set(involved.map((t) => t.dimension)).size > 1) {
+        return res.status(400).json({ message: 'Can only merge tags within the same dimension.' });
+    }
+
+    // series_tags: repoint, skipping series already linked to the target.
+    const { data: targetSeriesLinks } = await supabase.from('series_tags').select('series_id').eq('tag_id', targetId);
+    const seriesAlreadyLinked = new Set((targetSeriesLinks || []).map((r) => r.series_id));
+
+    const { data: sourceSeriesLinks, error: sourceSeriesLinksError } = await supabase
+        .from('series_tags')
+        .select('series_id')
+        .in('tag_id', sourceIds);
+    if (sourceSeriesLinksError) return res.status(500).json({ message: sourceSeriesLinksError.message });
+
+    const seriesToRelink = [...new Set((sourceSeriesLinks || []).map((r) => r.series_id))].filter(
+        (sid) => !seriesAlreadyLinked.has(sid)
+    );
+    if (seriesToRelink.length > 0) {
+        const { error: insertError } = await supabase
+            .from('series_tags')
+            .insert(seriesToRelink.map((series_id) => ({ series_id, tag_id: targetId })));
+        if (insertError) return res.status(500).json({ message: insertError.message });
+    }
+
+    const { error: deleteSeriesLinksError } = await supabase.from('series_tags').delete().in('tag_id', sourceIds);
+    if (deleteSeriesLinksError) return res.status(500).json({ message: deleteSeriesLinksError.message });
+
+    // series_candidate_tags: same repoint-then-delete pattern.
+    const { data: targetCandidateLinks } = await supabase
+        .from('series_candidate_tags')
+        .select('candidate_id')
+        .eq('tag_id', targetId);
+    const candidatesAlreadyLinked = new Set((targetCandidateLinks || []).map((r) => r.candidate_id));
+
+    const { data: sourceCandidateLinks, error: sourceCandidateLinksError } = await supabase
+        .from('series_candidate_tags')
+        .select('candidate_id')
+        .in('tag_id', sourceIds);
+    if (sourceCandidateLinksError) return res.status(500).json({ message: sourceCandidateLinksError.message });
+
+    const candidatesToRelink = [...new Set((sourceCandidateLinks || []).map((r) => r.candidate_id))].filter(
+        (cid) => !candidatesAlreadyLinked.has(cid)
+    );
+    if (candidatesToRelink.length > 0) {
+        const { error: insertError } = await supabase
+            .from('series_candidate_tags')
+            .insert(candidatesToRelink.map((candidate_id) => ({ candidate_id, tag_id: targetId })));
+        if (insertError) return res.status(500).json({ message: insertError.message });
+    }
+
+    const { error: deleteCandidateLinksError } = await supabase
+        .from('series_candidate_tags')
+        .delete()
+        .in('tag_id', sourceIds);
+    if (deleteCandidateLinksError) return res.status(500).json({ message: deleteCandidateLinksError.message });
+
+    const { error: deleteTagsError } = await supabase.from('tags').delete().in('id', sourceIds);
+    if (deleteTagsError) return res.status(500).json({ message: deleteTagsError.message });
+
+    res.json({ message: 'Tags merged', data: { target_id: targetId, merged_ids: sourceIds } });
+});
+
+// Route 9c-3 - Permanently delete a tag (admin only). Unlike toggle (which
+// just hides it from pickers), this removes every series_tags/
+// series_candidate_tags row referencing it first, then the tag itself --
+// same cleanup-children-before-parent pattern used throughout this file.
+app.delete('/admin/tags/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { error: seriesLinksError } = await supabase.from('series_tags').delete().eq('tag_id', id);
+    if (seriesLinksError) return res.status(500).json({ message: seriesLinksError.message });
+
+    const { error: candidateLinksError } = await supabase.from('series_candidate_tags').delete().eq('tag_id', id);
+    if (candidateLinksError) return res.status(500).json({ message: candidateLinksError.message });
+
+    const { error } = await supabase.from('tags').delete().eq('id', id);
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: 'Tag deleted' });
+});
+
+// Route 9c-4 - List every genre with how many published series use it
+// (admin only). Genres today only ever get created as a side effect of
+// approving a candidate (find-or-create by name, see the approve route
+// below) -- this is the first place they can be viewed, renamed, merged,
+// or deleted directly.
+app.get('/admin/genres', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const [genresRes, linksRes] = await Promise.all([
+        supabase.from('genres').select('id, name').order('name', { ascending: true }),
+        supabase.from('series_genres').select('genre_id'),
+    ]);
+
+    if (genresRes.error) return res.status(500).json({ message: genresRes.error.message });
+    if (linksRes.error) return res.status(500).json({ message: linksRes.error.message });
+
+    const countByGenre = new Map<number, number>();
+    for (const row of linksRes.data) {
+        countByGenre.set(row.genre_id, (countByGenre.get(row.genre_id) || 0) + 1);
+    }
+
+    const data = genresRes.data.map((g) => ({ ...g, series_count: countByGenre.get(g.id) || 0 }));
+
+    res.json({ message: 'Genres', count: data.length, data });
+});
+
+// Route 9c-5 - Rename a genre (admin only). Same duplicate guard as tag
+// rename -- e.g. "Romance" and "romance" existing as two separate rows is
+// exactly the kind of thing this is for catching, not creating more of.
+app.patch('/admin/genres/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const { name } = req.body || {};
+
+    if (!name || !String(name).trim()) {
+        return res.status(400).json({ message: 'name is required.' });
+    }
+
+    const { data: existing, error: fetchError } = await supabase.from('genres').select('id').eq('id', id).maybeSingle();
+    if (fetchError) return res.status(500).json({ message: fetchError.message });
+    if (!existing) return res.status(404).json({ message: 'Genre not found.' });
+
+    const { data: siblings, error: siblingsError } = await supabase.from('genres').select('id, name').neq('id', id);
+    if (siblingsError) return res.status(500).json({ message: siblingsError.message });
+
+    const collision = (siblings || []).find((g) => g.name.trim().toLowerCase() === String(name).trim().toLowerCase());
+    if (collision) {
+        return res.status(409).json({
+            message: '"' + name + '" already exists (id ' + collision.id + '). Merge into it instead of renaming.',
+        });
+    }
+
+    const { data, error } = await supabase
+        .from('genres')
+        .update({ name })
+        .eq('id', id)
+        .select('id, name')
+        .single();
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: 'Genre renamed', data });
+});
+
+// Route 9c-6 - Merge one or more genres into another (admin only). Same
+// repoint-skip-duplicates-then-delete pattern as tag merge. Body:
+// { source_ids: number[], target_id }.
+app.post('/admin/genres/merge', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const targetId = parseInt(req.body?.target_id);
+    const sourceIds: number[] = (req.body?.source_ids || [])
+        .map((id: unknown) => parseInt(String(id)))
+        .filter((id: number) => !Number.isNaN(id) && id !== targetId);
+
+    if (!targetId || sourceIds.length === 0) {
+        return res.status(400).json({ message: 'target_id and at least one distinct source_id are required.' });
+    }
+
+    const { data: involved, error: involvedError } = await supabase
+        .from('genres')
+        .select('id')
+        .in('id', [targetId, ...sourceIds]);
+
+    if (involvedError) return res.status(500).json({ message: involvedError.message });
+    if (!involved || involved.length !== sourceIds.length + 1) {
+        return res.status(404).json({ message: 'One or more genres were not found.' });
+    }
+
+    const { data: targetLinks } = await supabase.from('series_genres').select('series_id').eq('genre_id', targetId);
+    const seriesAlreadyLinked = new Set((targetLinks || []).map((r) => r.series_id));
+
+    const { data: sourceLinks, error: sourceLinksError } = await supabase
+        .from('series_genres')
+        .select('series_id')
+        .in('genre_id', sourceIds);
+    if (sourceLinksError) return res.status(500).json({ message: sourceLinksError.message });
+
+    const seriesToRelink = [...new Set((sourceLinks || []).map((r) => r.series_id))].filter(
+        (sid) => !seriesAlreadyLinked.has(sid)
+    );
+    if (seriesToRelink.length > 0) {
+        const { error: insertError } = await supabase
+            .from('series_genres')
+            .insert(seriesToRelink.map((series_id) => ({ series_id, genre_id: targetId })));
+        if (insertError) return res.status(500).json({ message: insertError.message });
+    }
+
+    const { error: deleteLinksError } = await supabase.from('series_genres').delete().in('genre_id', sourceIds);
+    if (deleteLinksError) return res.status(500).json({ message: deleteLinksError.message });
+
+    const { error: deleteGenresError } = await supabase.from('genres').delete().in('id', sourceIds);
+    if (deleteGenresError) return res.status(500).json({ message: deleteGenresError.message });
+
+    res.json({ message: 'Genres merged', data: { target_id: targetId, merged_ids: sourceIds } });
+});
+
+// Route 9c-7 - Permanently delete a genre (admin only). Removes its
+// series_genres links first, then the genre row -- doesn't touch the
+// series themselves, just un-tags them from this genre.
+app.delete('/admin/genres/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { error: linksError } = await supabase.from('series_genres').delete().eq('genre_id', id);
+    if (linksError) return res.status(500).json({ message: linksError.message });
+
+    const { error } = await supabase.from('genres').delete().eq('id', id);
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: 'Genre deleted' });
+});
+
 // Route 9f - Save a candidate's taxonomy (Curated Attributes + Discovery Tags) (admin only).
 // Persists immediately, independent of approve/reject — this is what lets curation happen
 // progressively across sessions, per BLumi Taxonomy v1. Body: { romance_pace?, emotional_intensity?,
