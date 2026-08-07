@@ -238,10 +238,33 @@ app.get('/series', async (req: Request, res: Response) => {
         return res.status(500).json({ message: error.message});
     }
 
+    // Curated-collection membership per series, for SeriesEditModal's
+    // Collections picker (mirrors tag_ids/genre_names in spirit -- though
+    // unlike those two, this is actually populated below rather than left
+    // for the frontend to default to empty). Two small queries (curated
+    // collection ids, then their memberships) rather than a nested filter
+    // through the join table, since supabase-js can't filter a nested
+    // relation's own relation in one .select() call.
+    const { data: curatedCollections } = await supabase.from('collections').select('id').eq('is_curated', true);
+    const curatedIds = (curatedCollections || []).map((c) => c.id);
+
+    const collectionIdsBySeries = new Map<number, number[]>();
+    if (curatedIds.length > 0) {
+        const { data: memberships } = await supabase
+            .from('collection_series')
+            .select('series_id, collection_id')
+            .in('collection_id', curatedIds);
+        for (const row of memberships || []) {
+            const list = collectionIdsBySeries.get(row.series_id) || [];
+            list.push(row.collection_id);
+            collectionIdsBySeries.set(row.series_id, list);
+        }
+    }
+
     const flattened = data.map((row: any) => {
         const { series_tags, ...rest } = row;
         const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
-        return { ...rest, tags };
+        return { ...rest, tags, collection_ids: collectionIdsBySeries.get(row.id) || [] };
     });
 
     const response: ApiResponse<Series[]> = {
@@ -288,9 +311,21 @@ app.get('/series/:id', async (req: Request, res: Response) => {
     const tags = (series_tags || []).map((row: any) => row.tags).filter(Boolean);
     const tag_ids = tags.map((t: any) => t.id);
 
+    // Curated-collection membership, same flat-ids shape as tag_ids above,
+    // for SeriesEditModal's Collections picker. Personal (non-curated)
+    // collections are deliberately excluded -- this is the admin edit
+    // screen, it should never surface or let anyone touch what's in some
+    // individual user's own collection.
+    const { data: curatedMemberships } = await supabase
+        .from('collection_series')
+        .select('collection_id, collections!inner (is_curated)')
+        .eq('series_id', id)
+        .eq('collections.is_curated', true);
+    const collection_ids = (curatedMemberships || []).map((row: any) => row.collection_id);
+
     res.json({
         message: "Success",
-        data: { ...rest, genre_names, tags, tag_ids }
+        data: { ...rest, genre_names, tags, tag_ids, collection_ids }
     });
 });
 
@@ -1894,6 +1929,59 @@ app.patch('/admin/series/:id', async (req: Request, res: Response) => {
         }
     }
 
+    // Curated-collection membership: same diff-and-repoint approach as
+    // genres/tags above, but scoped to is_curated collections only -- a
+    // series can also sit in any number of individual users' personal
+    // collections, and this admin screen must never touch those.
+    if (Array.isArray(body.collection_ids)) {
+        const { data: curatedCollections, error: curatedError } = await supabase
+            .from('collections')
+            .select('id')
+            .eq('is_curated', true);
+
+        if (curatedError) {
+            return res.status(500).json({ message: curatedError.message });
+        }
+
+        const curatedIds = new Set((curatedCollections || []).map((c) => c.id));
+
+        const { data: existingMemberships, error: fetchMembershipsError } = await supabase
+            .from('collection_series')
+            .select('collection_id')
+            .eq('series_id', id)
+            .in('collection_id', [...curatedIds]);
+
+        if (fetchMembershipsError) {
+            return res.status(500).json({ message: fetchMembershipsError.message });
+        }
+
+        const existingIds = new Set((existingMemberships || []).map((row) => row.collection_id));
+        const desiredIds = new Set((body.collection_ids as number[]).filter((cid) => curatedIds.has(cid)));
+
+        const toAdd = [...desiredIds].filter((cid) => !existingIds.has(cid));
+        const toRemove = [...existingIds].filter((cid) => !desiredIds.has(cid));
+
+        if (toAdd.length > 0) {
+            const { error: insertError } = await supabase
+                .from('collection_series')
+                .insert(toAdd.map((collectionId) => ({ collection_id: collectionId, series_id: id })));
+            if (insertError) {
+                return res.status(500).json({ message: insertError.message });
+            }
+        }
+
+        if (toRemove.length > 0) {
+            const { error: removeError } = await supabase
+                .from('collection_series')
+                .delete()
+                .eq('series_id', id)
+                .in('collection_id', toRemove);
+            if (removeError) {
+                return res.status(500).json({ message: removeError.message });
+            }
+        }
+    }
+
     res.status(200).json({ message: 'Series updated' });
 });
 
@@ -1909,7 +1997,7 @@ app.delete('/admin/series/:id', async (req: Request, res: Response) => {
 
     const id = parseInt(req.params.id as string);
 
-    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks'];
+    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series'];
 
     for (const table of cleanupTables) {
         const { error } = await supabase.from(table).delete().eq('series_id', id);
@@ -2116,6 +2204,427 @@ app.delete('/admin/curator-picks/:id', async (req: Request, res: Response) => {
     }
 
     res.status(200).json({ message: 'Curator pick removed' });
+});
+
+// Shared shape-builder for a list of collections (personal or curated),
+// with series_count and, for personal ones when requestingUserId is the
+// owner, a real progress_pct computed from that user's own user_lists
+// status -- not meaningful for a curated collection (it isn't "your"
+// watchlist), so progress_pct is always null there.
+async function fetchCollectionsJoined(
+    filter: { is_curated: boolean; owner_user_id?: number },
+    requestingUserId: number | null
+) {
+    let query = supabase
+        .from('collections')
+        .select('id, title, description, is_curated, owner_user_id, created_at, updated_at, collection_series (series_id)')
+        .eq('is_curated', filter.is_curated)
+        .order('updated_at', { ascending: false });
+
+    if (filter.owner_user_id !== undefined) {
+        query = query.eq('owner_user_id', filter.owner_user_id);
+    }
+
+    const { data, error } = await query;
+    if (error || !data) return { error, data: [] as any[] };
+
+    const allSeriesIds = [...new Set(data.flatMap((c: any) => (c.collection_series || []).map((cs: any) => cs.series_id)))];
+
+    let watchStatusById = new Map<number, string>();
+    if (requestingUserId !== null && allSeriesIds.length > 0) {
+        const { data: statusRows } = await supabase
+            .from('user_lists')
+            .select('series_id, status')
+            .eq('user_id', requestingUserId)
+            .in('series_id', allSeriesIds);
+        for (const row of statusRows || []) {
+            watchStatusById.set(row.series_id, row.status);
+        }
+    }
+
+    const shaped = data.map((c: any) => {
+        const seriesIds: number[] = (c.collection_series || []).map((cs: any) => cs.series_id);
+        const isMine = requestingUserId !== null && c.owner_user_id === requestingUserId;
+
+        let progressPct: number | null = null;
+        if (isMine && !c.is_curated && seriesIds.length > 0) {
+            const completedCount = seriesIds.filter((id) => watchStatusById.get(id) === 'completed').length;
+            progressPct = Math.round((completedCount / seriesIds.length) * 100);
+        }
+
+        return {
+            id: c.id,
+            title: c.title,
+            description: c.description,
+            is_curated: c.is_curated,
+            is_mine: isMine,
+            series_count: seriesIds.length,
+            progress_pct: progressPct,
+            updated_at: c.updated_at,
+            created_at: c.created_at,
+        };
+    });
+
+    return { error: null, data: shaped };
+}
+
+// Route 25 - Public: browse collections. ?mine=true (auth required) returns
+// only the caller's own personal collections; otherwise returns every
+// admin-curated collection (public, no auth needed) -- matches the "All
+// Collections" / "My Collections" filter chips on the Collections page,
+// which fetches each separately rather than one mixed list.
+app.get('/collections', async (req: Request, res: Response) => {
+    const requestingUserId = await getOrCreateUserId(req.headers.authorization);
+
+    if (req.query.mine === 'true') {
+        if (requestingUserId === null) {
+            return res.status(401).json({ message: 'You must be signed in to view your collections.' });
+        }
+        const { error, data } = await fetchCollectionsJoined({ is_curated: false, owner_user_id: requestingUserId }, requestingUserId);
+        if (error) return res.status(500).json({ message: error.message });
+        return res.json({ message: 'Your collections', count: data.length, data });
+    }
+
+    const { error, data } = await fetchCollectionsJoined({ is_curated: true }, requestingUserId);
+    if (error) return res.status(500).json({ message: error.message });
+    res.json({ message: 'Curated collections', count: data.length, data });
+});
+
+// Route 26 - Public: one collection's detail, with its series joined in
+// (same shape as GET /series' cards, so SeriesCard/CollectionsAuthed can
+// reuse existing rendering). A personal collection is only visible to its
+// owner; a curated one is visible to everyone.
+app.get('/collections/:id', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const requestingUserId = await getOrCreateUserId(req.headers.authorization);
+
+    const { data: collection, error: collectionError } = await supabase
+        .from('collections')
+        .select('id, title, description, is_curated, owner_user_id, created_at, updated_at')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (collectionError || !collection) {
+        return res.status(404).json({ message: 'Collection not found' });
+    }
+
+    if (!collection.is_curated && collection.owner_user_id !== requestingUserId) {
+        return res.status(403).json({ message: "You don't have access to this collection." });
+    }
+
+    const { data: memberRows, error: memberError } = await supabase
+        .from('collection_series')
+        .select('sort_order, series (*)')
+        .eq('collection_id', id)
+        .order('sort_order', { ascending: true });
+
+    if (memberError) {
+        return res.status(500).json({ message: memberError.message });
+    }
+
+    res.json({
+        message: 'Collection',
+        data: {
+            id: collection.id,
+            title: collection.title,
+            description: collection.description,
+            is_curated: collection.is_curated,
+            is_mine: requestingUserId !== null && collection.owner_user_id === requestingUserId,
+            series: (memberRows || []).map((row: any) => row.series).filter(Boolean),
+        },
+    });
+});
+
+// Route 27 - Create a personal collection (auth required). Always
+// is_curated: false, owner_user_id: the caller -- curated collections are
+// only created through POST /admin/collections below.
+app.post('/collections', async (req: Request, res: Response) => {
+    const userId = await getOrCreateUserId(req.headers.authorization);
+    if (userId === null) {
+        return res.status(401).json({ message: 'You must be signed in to create a collection.' });
+    }
+
+    const { title, description } = req.body || {};
+    if (!title || typeof title !== 'string' || !title.trim()) {
+        return res.status(400).json({ message: 'title is required.' });
+    }
+
+    const { data, error } = await supabase
+        .from('collections')
+        .insert({ title: title.trim(), description: description || null, is_curated: false, owner_user_id: userId })
+        .select()
+        .single();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(201).json({ message: 'Collection created', data });
+});
+
+// Helper - Load a collection and confirm the caller may modify it: the
+// owner of a personal collection, or an admin for a curated one. Sends the
+// appropriate error response itself and returns null if the caller should
+// stop.
+async function loadEditableCollection(
+    req: Request,
+    res: Response,
+    id: number,
+    opts: { allowCurated: boolean }
+): Promise<{ id: number; is_curated: boolean; owner_user_id: number | null } | null> {
+    const { data: collection, error } = await supabase
+        .from('collections')
+        .select('id, is_curated, owner_user_id')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (error || !collection) {
+        res.status(404).json({ message: 'Collection not found' });
+        return null;
+    }
+
+    if (collection.is_curated) {
+        if (!opts.allowCurated) {
+            res.status(400).json({ message: 'This is a curated collection -- manage it from the admin Collections page.' });
+            return null;
+        }
+        const isAdmin = await requireAdmin(req, res);
+        if (!isAdmin) return null;
+        return collection;
+    }
+
+    const userId = await getOrCreateUserId(req.headers.authorization);
+    if (userId === null) {
+        res.status(401).json({ message: 'You must be signed in.' });
+        return null;
+    }
+    if (collection.owner_user_id !== userId) {
+        res.status(403).json({ message: "You don't own this collection." });
+        return null;
+    }
+    return collection;
+}
+
+// Route 28 - Rename/redescribe a personal collection (owner only).
+app.patch('/collections/:id', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: false });
+    if (!collection) return;
+
+    const { title, description } = req.body || {};
+    const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (title !== undefined) update.title = title;
+    if (description !== undefined) update.description = description;
+
+    const { data, error } = await supabase.from('collections').update(update).eq('id', id).select().single();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({ message: 'Collection updated', data });
+});
+
+// Route 29 - Delete a personal collection (owner only). Only removes the
+// collection itself and its collection_series membership rows -- never
+// touches the series or the owner's ratings/watchlist.
+app.delete('/collections/:id', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: false });
+    if (!collection) return;
+
+    const { error: memberError } = await supabase.from('collection_series').delete().eq('collection_id', id);
+    if (memberError) return res.status(500).json({ message: memberError.message });
+
+    const { error } = await supabase.from('collections').delete().eq('id', id);
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.status(200).json({ message: 'Collection deleted' });
+});
+
+// Route 30 - Add a series to a personal collection (owner only). Body:
+// { series_id }.
+app.post('/collections/:id/series', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: false });
+    if (!collection) return;
+
+    const { series_id } = req.body || {};
+    if (!series_id) {
+        return res.status(400).json({ message: 'series_id is required.' });
+    }
+
+    let nextSortOrder = 0;
+    const { data: existing } = await supabase
+        .from('collection_series')
+        .select('sort_order')
+        .eq('collection_id', id)
+        .order('sort_order', { ascending: false })
+        .limit(1);
+    if (existing && existing.length > 0) nextSortOrder = existing[0].sort_order + 1;
+
+    const { error } = await supabase
+        .from('collection_series')
+        .insert({ collection_id: id, series_id, sort_order: nextSortOrder });
+
+    if (error) {
+        if (error.code === '23505') {
+            return res.status(409).json({ message: 'That series is already in this collection.' });
+        }
+        return res.status(500).json({ message: error.message });
+    }
+
+    await supabase.from('collections').update({ updated_at: new Date().toISOString() }).eq('id', id);
+
+    res.status(201).json({ message: 'Added to collection' });
+});
+
+// Route 31 - Remove a series from a personal collection (owner only).
+app.delete('/collections/:id/series/:seriesId', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: false });
+    if (!collection) return;
+
+    const seriesId = parseInt(req.params.seriesId as string);
+
+    const { error } = await supabase
+        .from('collection_series')
+        .delete()
+        .eq('collection_id', id)
+        .eq('series_id', seriesId);
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    await supabase.from('collections').update({ updated_at: new Date().toISOString() }).eq('id', id);
+
+    res.status(200).json({ message: 'Removed from collection' });
+});
+
+// Route 32 - Admin: list every curated collection (for app/admin/collections).
+app.get('/admin/collections', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { error, data } = await fetchCollectionsJoined({ is_curated: true }, null);
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: 'Curated collections', count: data.length, data });
+});
+
+// Route 33 - Admin: create a curated collection. owner_user_id is set to
+// whichever admin created it (audit only -- ownership doesn't gate access
+// the way it does for personal collections; any admin can edit any curated
+// collection, see loadEditableCollection).
+app.post('/admin/collections', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const { title, description } = req.body || {};
+    if (!title || typeof title !== 'string' || !title.trim()) {
+        return res.status(400).json({ message: 'title is required.' });
+    }
+
+    const authHeader = req.headers.authorization;
+    const creatorUserId = await getOrCreateUserId(authHeader);
+
+    const { data, error } = await supabase
+        .from('collections')
+        .insert({ title: title.trim(), description: description || null, is_curated: true, owner_user_id: creatorUserId })
+        .select()
+        .single();
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.status(201).json({ message: 'Curated collection created', data });
+});
+
+// Route 34 - Admin: rename/redescribe a curated collection.
+app.patch('/admin/collections/:id', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: true });
+    if (!collection) return;
+
+    const { title, description } = req.body || {};
+    const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (title !== undefined) update.title = title;
+    if (description !== undefined) update.description = description;
+
+    const { data, error } = await supabase.from('collections').update(update).eq('id', id).select().single();
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.json({ message: 'Collection updated', data });
+});
+
+// Route 35 - Admin: delete a curated collection.
+app.delete('/admin/collections/:id', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: true });
+    if (!collection) return;
+
+    const { error: memberError } = await supabase.from('collection_series').delete().eq('collection_id', id);
+    if (memberError) return res.status(500).json({ message: memberError.message });
+
+    const { error } = await supabase.from('collections').delete().eq('id', id);
+    if (error) return res.status(500).json({ message: error.message });
+
+    res.status(200).json({ message: 'Collection deleted' });
+});
+
+// Route 36 - Admin: add a series to a curated collection. Body: { series_id }.
+app.post('/admin/collections/:id/series', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: true });
+    if (!collection) return;
+
+    const { series_id } = req.body || {};
+    if (!series_id) {
+        return res.status(400).json({ message: 'series_id is required.' });
+    }
+
+    let nextSortOrder = 0;
+    const { data: existing } = await supabase
+        .from('collection_series')
+        .select('sort_order')
+        .eq('collection_id', id)
+        .order('sort_order', { ascending: false })
+        .limit(1);
+    if (existing && existing.length > 0) nextSortOrder = existing[0].sort_order + 1;
+
+    const { error } = await supabase
+        .from('collection_series')
+        .insert({ collection_id: id, series_id, sort_order: nextSortOrder });
+
+    if (error) {
+        if (error.code === '23505') {
+            return res.status(409).json({ message: 'That series is already in this collection.' });
+        }
+        return res.status(500).json({ message: error.message });
+    }
+
+    await supabase.from('collections').update({ updated_at: new Date().toISOString() }).eq('id', id);
+
+    res.status(201).json({ message: 'Added to collection' });
+});
+
+// Route 37 - Admin: remove a series from a curated collection.
+app.delete('/admin/collections/:id/series/:seriesId', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const collection = await loadEditableCollection(req, res, id, { allowCurated: true });
+    if (!collection) return;
+
+    const seriesId = parseInt(req.params.seriesId as string);
+
+    const { error } = await supabase
+        .from('collection_series')
+        .delete()
+        .eq('collection_id', id)
+        .eq('series_id', seriesId);
+
+    if (error) return res.status(500).json({ message: error.message });
+
+    await supabase.from('collections').update({ updated_at: new Date().toISOString() }).eq('id', id);
+
+    res.status(200).json({ message: 'Removed from collection' });
 });
 
 app.listen(PORT, () => {
