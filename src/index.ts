@@ -1909,7 +1909,7 @@ app.delete('/admin/series/:id', async (req: Request, res: Response) => {
 
     const id = parseInt(req.params.id as string);
 
-    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists'];
+    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks'];
 
     for (const table of cleanupTables) {
         const { error } = await supabase.from(table).delete().eq('series_id', id);
