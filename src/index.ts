@@ -259,10 +259,35 @@ app.get('/series', async (req: Request, res: Response) => {
         }
     }
 
+    // Real average_rating/rating_count per series, computed from actual
+    // `ratings` rows -- same aggregation getCuratorPicksData() already does
+    // for the homepage's Curator's Picks section. Previously nothing here
+    // read the ratings table at all, so every card fell back to the
+    // hardcoded REAL_TRENDING_OVERRIDES/mock rating helpers regardless of
+    // what anyone had actually rated.
+    const seriesIds = data.map((row: any) => row.id);
+    const ratingsBySeries = new Map<number, number[]>();
+    if (seriesIds.length > 0) {
+        const { data: ratingsRows } = await supabase.from('ratings').select('series_id, score').in('series_id', seriesIds);
+        for (const row of ratingsRows || []) {
+            const list = ratingsBySeries.get(row.series_id) || [];
+            list.push(row.score);
+            ratingsBySeries.set(row.series_id, list);
+        }
+    }
+
     const flattened = data.map((row: any) => {
         const { series_tags, ...rest } = row;
         const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
-        return { ...rest, tags, collection_ids: collectionIdsBySeries.get(row.id) || [] };
+        const scores = ratingsBySeries.get(row.id) || [];
+        const average_rating = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+        return {
+            ...rest,
+            tags,
+            collection_ids: collectionIdsBySeries.get(row.id) || [],
+            average_rating,
+            rating_count: scores.length,
+        };
     });
 
     const response: ApiResponse<Series[]> = {
@@ -309,6 +334,14 @@ app.get('/series/:id', async (req: Request, res: Response) => {
     const tags = (series_tags || []).map((row: any) => row.tags).filter(Boolean);
     const tag_ids = tags.map((t: any) => t.id);
 
+    // Real average_rating/rating_count for this series, same aggregation
+    // as GET /series -- the detail page previously showed no rating at
+    // all, since nothing anywhere read the `ratings` table back.
+    const { data: ratingsRows } = await supabase.from('ratings').select('score').eq('series_id', id);
+    const scores = (ratingsRows || []).map((r: any) => r.score);
+    const average_rating = scores.length > 0 ? scores.reduce((a: number, b: number) => a + b, 0) / scores.length : null;
+    const rating_count = scores.length;
+
     // Curated-collection membership, same flat-ids shape as tag_ids above,
     // for SeriesEditModal's Collections picker. Personal (non-curated)
     // collections are deliberately excluded -- this is the admin edit
@@ -323,7 +356,7 @@ app.get('/series/:id', async (req: Request, res: Response) => {
 
     res.json({
         message: "Success",
-        data: { ...rest, genre_names, tags, tag_ids, collection_ids }
+        data: { ...rest, genre_names, tags, tag_ids, collection_ids, average_rating, rating_count }
     });
 });
 
@@ -441,7 +474,8 @@ async function requireAdmin(req: Request, res: Response): Promise<boolean> {
     return true;
 }
 
-// Route 4 - Submit a rating
+// Route 4 - Submit a rating (upsert -- resubmitting for a series you've
+// already rated updates that row instead of creating a duplicate one).
 app.post('/ratings', async (req: Request, res: Response) => {
     const { series_id, score, review_text } = req.body;
 
@@ -467,7 +501,10 @@ app.post('/ratings', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
         .from('ratings')
-        .insert([{ user_id, series_id, score, review_text }])
+        .upsert(
+            [{ user_id, series_id, score, review_text }],
+            { onConflict: 'user_id,series_id' }
+        )
         .select();
 
     if (error) {
@@ -480,6 +517,39 @@ app.post('/ratings', async (req: Request, res: Response) => {
     };
 
     res.status(201).json(response);
+});
+
+// Route 4b - Get the logged-in user's own rating for one series, so
+// RatingForm can prefill instead of showing blank for someone who's
+// already rated (paired with the upsert above -- without this lookup,
+// resubmitting silently overwrote a prior review with no warning at all).
+// Mirrors GET /watchlist/:seriesId's per-user/per-series shape.
+app.get('/ratings/mine/:seriesId', async (req: Request, res: Response) => {
+    const user_id = await getOrCreateUserId(req.headers.authorization);
+
+    if (!user_id) {
+        return res.status(401).json({
+            message: 'You must be signed in to view your rating'
+        });
+    }
+
+    const seriesId = parseInt(req.params.seriesId as string);
+
+    const { data, error } = await supabase
+        .from('ratings')
+        .select('score, review_text')
+        .eq('user_id', user_id)
+        .eq('series_id', seriesId)
+        .maybeSingle();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({
+        message: 'Your rating',
+        data: data ?? null
+    });
 });
 
 // Route 5 - Add or update a watchlist entry (upsert)
