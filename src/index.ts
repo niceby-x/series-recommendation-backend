@@ -1,10 +1,10 @@
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { createClient } from '@supabase/supabase-js';
 import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 import { Series, Rating, ApiResponse } from './types';
+import { supabase } from './services/supabase';
 
 const app = express();
 const PORT = 3001;
@@ -26,12 +26,6 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-//Supabase client
-const supabase = createClient(
-    process.env.SUPABASE_URL as string,
-    process.env.SUPABASE_KEY as string
-);
 
 // State for the currently-running (or most recently run) TMDB discovery
 // import. The live log tail while a run is in progress stays in memory
@@ -134,7 +128,11 @@ async function reconcileOrphanedImportRun() {
 // needed and node would just ignore an unknown loader for a .js file.
 async function startImportRun(limit: number) {
     const runningCompiled = __filename.endsWith('.js');
-    const scriptPath = path.join(__dirname, runningCompiled ? 'discover-series-by-keyword.js' : 'discover-series-by-keyword.ts');
+    const scriptPath = path.join(
+        __dirname,
+        'scripts',
+        runningCompiled ? 'discover-series-by-keyword.js' : 'discover-series-by-keyword.ts'
+    );
     const command = process.platform === 'win32' ? 'node.exe' : 'node';
     const args = runningCompiled
         ? [scriptPath, '--limit=' + limit]

@@ -37,7 +37,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-        run: node --import tsx src/enrich-pending-candidates.ts
+        run: node --import tsx src/scripts/enrich-pending-candidates.ts
 
       # Runs even if the enrich step above failed -- fetching posters for
       # already-published series doesn't depend on that step succeeding,
@@ -50,4 +50,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
-        run: node --import tsx src/fetch-posters.ts
+        run: node --import tsx src/scripts/fetch-posters.ts

@@ -50,7 +50,7 @@ jobs:
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            node --import tsx src/${{ inputs.script }}.ts --dry-run
+            node --import tsx src/scripts/${{ inputs.script }}.ts --dry-run
           else
-            node --import tsx src/${{ inputs.script }}.ts
+            node --import tsx src/scripts/${{ inputs.script }}.ts
           fi

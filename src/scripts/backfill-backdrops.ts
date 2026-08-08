@@ -14,24 +14,13 @@
 //      for older rows that predate tmdb_id being tracked.
 //
 // Usage:
-//   npx tsx src/backfill-backdrops.ts            (writes to Supabase)
-//   npx tsx src/backfill-backdrops.ts --dry-run   (prints what it would do)
+//   npx tsx src/scripts/backfill-backdrops.ts            (writes to Supabase)
+//   npx tsx src/scripts/backfill-backdrops.ts --dry-run   (prints what it would do)
 
-import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../services/supabase';
+import { TMDB_HEADERS } from '../services/tmdb';
 
-const supabase = createClient(
-    process.env.SUPABASE_URL as string,
-    process.env.SUPABASE_KEY as string
-);
-
-const TMDB_TOKEN = process.env.TMDB_ACCESS_TOKEN as string;
 const DRY_RUN = process.argv.includes('--dry-run');
-
-const TMDB_HEADERS = {
-    Authorization: 'Bearer ' + TMDB_TOKEN,
-    accept: 'application/json',
-};
 
 interface SeriesRow {
     id: number;

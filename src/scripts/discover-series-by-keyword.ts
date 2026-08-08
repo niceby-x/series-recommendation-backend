@@ -1,12 +1,5 @@
-import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
-
-const supabase = createClient(
-    process.env.SUPABASE_URL as string,
-    process.env.SUPABASE_KEY as string
-);
-
-const TMDB_TOKEN = process.env.TMDB_ACCESS_TOKEN as string;
+import { supabase } from '../services/supabase';
+import { TMDB_HEADERS } from '../services/tmdb';
 
 // Maps TMDB origin_country / production_countries codes to the country labels your `series` table uses.
 const COUNTRY_CODE_LABELS: Record<string, string> = {
@@ -32,11 +25,6 @@ const MAX_PAGES = 50;
 // Safety cap on how many new candidates to queue in one run (across both TV and movies combined),
 // so a single run stays reviewable. Override with --limit=300 on the command line.
 const DEFAULT_LIMIT = 150;
-
-const TMDB_HEADERS = {
-    Authorization: 'Bearer ' + TMDB_TOKEN,
-    accept: 'application/json',
-};
 
 const DRY_RUN = process.argv.includes('--dry-run');
 let SOURCE_KEYWORD = "boys' love (bl)";

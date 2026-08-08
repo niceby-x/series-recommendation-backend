@@ -1,12 +1,5 @@
-import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
-
-const supabase = createClient(
-    process.env.SUPABASE_URL as string,
-    process.env.SUPABASE_KEY as string
-);
-
-const TMDB_TOKEN = process.env.TMDB_ACCESS_TOKEN as string;
+import { supabase } from '../services/supabase';
+import { TMDB_HEADERS } from '../services/tmdb';
 
 interface Series {
     id: number;
@@ -23,10 +16,7 @@ async function searchTMDBImages(title: string, year: number): Promise<TMDBImageU
     const url = `https://api.themoviedb.org/3/search/tv?query=${encodeURIComponent(title)}&first_air_date_year=${year}`;
 
     const res = await fetch(url, {
-        headers: {
-            Authorization: `Bearer ${TMDB_TOKEN}`,
-            accept: 'application/json',
-        },
+        headers: TMDB_HEADERS,
     });
 
     if (!res.ok) {

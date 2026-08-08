@@ -1,18 +1,7 @@
-import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../services/supabase';
+import { TMDB_HEADERS } from '../services/tmdb';
 
-const supabase = createClient(
-    process.env.SUPABASE_URL as string,
-    process.env.SUPABASE_KEY as string
-);
-
-const TMDB_TOKEN = process.env.TMDB_ACCESS_TOKEN as string;
 const ANIMATION_GENRE_ID = 16;
-
-const TMDB_HEADERS = {
-    Authorization: 'Bearer ' + TMDB_TOKEN,
-    accept: 'application/json',
-};
 
 async function run() {
     // Only pending candidates matter here — approved/rejected ones are already decided.
