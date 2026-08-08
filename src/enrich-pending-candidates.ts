@@ -18,7 +18,7 @@ async function run() {
     // Only pending candidates matter here — approved/rejected ones are already decided.
     const { data: candidates, error } = await supabase
         .from('series_candidates')
-        .select('id, tmdb_id, title, number_of_seasons')
+        .select('id, tmdb_id, title, media_type, number_of_seasons')
         .eq('review_status', 'pending')
         .is('number_of_seasons', null);
 
@@ -38,7 +38,13 @@ async function run() {
             continue;
         }
 
-        const res = await fetch('https://api.themoviedb.org/3/tv/' + candidate.tmdb_id, { headers: TMDB_HEADERS });
+        // Was always hardcoded to /tv/ regardless of the candidate's actual
+        // media_type -- movies were being looked up as TV shows and TMDB
+        // correctly 404'd nearly all of them. media_type is 'tv' or 'movie'
+        // (see discover-series-by-keyword.ts), matching the same
+        // tv-vs-movie endpoint split that script already uses.
+        const endpoint = candidate.media_type === 'movie' ? 'movie' : 'tv';
+        const res = await fetch('https://api.themoviedb.org/3/' + endpoint + '/' + candidate.tmdb_id, { headers: TMDB_HEADERS });
 
         if (!res.ok) {
             console.error('  Failed to fetch details for "' + candidate.title + '": ' + res.status);
@@ -47,7 +53,10 @@ async function run() {
 
         const json = await res.json();
         const isAnimated = (json.genres || []).some((g: { id: number }) => g.id === ANIMATION_GENRE_ID);
-        const numberOfSeasons = json.number_of_seasons ?? null;
+        // Movies don't have seasons -- 0 rather than null so the
+        // `.is('number_of_seasons', null)` filter above doesn't keep
+        // re-selecting the same already-enriched movies on every future run.
+        const numberOfSeasons = endpoint === 'movie' ? 0 : json.number_of_seasons ?? null;
 
         const { error: updateError } = await supabase
             .from('series_candidates')
