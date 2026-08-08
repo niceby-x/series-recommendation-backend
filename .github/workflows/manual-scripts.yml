@@ -1,0 +1,56 @@
+name: Manual Scripts
+
+# workflow_dispatch only -- deliberately never scheduled. These scripts
+# either touch a lot of rows at once (bulk-add-series, backfill-backdrops)
+# or are one-off fixes (fix-missing-posters, backfill-approved-candidates)
+# meant to be run with a human watching, not fired unattended overnight.
+# Run this from the repo's Actions tab: pick the script, optionally check
+# dry_run first to preview without writing anything (only
+# backfill-backdrops.ts and backfill-approved-candidates.ts actually
+# support --dry-run -- the other two ignore the flag and always write).
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: 'Which script to run'
+        required: true
+        type: choice
+        options:
+          - bulk-add-series
+          - backfill-backdrops
+          - fix-missing-posters
+          - backfill-approved-candidates
+      dry_run:
+        description: 'Dry run (only applies to backfill-backdrops and backfill-approved-candidates)'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ${{ inputs.script }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            node --import tsx src/${{ inputs.script }}.ts --dry-run
+          else
+            node --import tsx src/${{ inputs.script }}.ts
+          fi

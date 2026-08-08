@@ -1,0 +1,53 @@
+name: Data Pipeline
+
+# Automates the routine, non-destructive scripts that just keep the
+# catalog's data quality up (filling in season counts/animated flags,
+# filling in missing posters/backdrops). Runs nightly, and can also be
+# triggered manually from the Actions tab to verify credentials or run it
+# on demand without waiting for the schedule.
+#
+# Deliberately does NOT include bulk-add-series.ts, backfill-backdrops.ts,
+# or fix-missing-posters.ts -- those touch a lot of rows at once and are
+# meant to be reviewed before running, not fired off unattended every
+# night. See manual-scripts.yml for those, workflow_dispatch-only.
+on:
+  schedule:
+    - cron: '0 0 * * *' # midnight UTC daily
+  workflow_dispatch:
+
+jobs:
+  enrich-and-fetch-posters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Enrich pending candidates (season counts, animated flag)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+        run: node --import tsx src/enrich-pending-candidates.ts
+
+      # Runs even if the enrich step above failed -- fetching posters for
+      # already-published series doesn't depend on that step succeeding,
+      # and skipping it too would just compound one failure into two.
+      # The job as a whole still shows failed in the Actions tab if either
+      # step failed, so nothing goes unnoticed.
+      - name: Fetch missing posters/backdrops
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+        run: node --import tsx src/fetch-posters.ts

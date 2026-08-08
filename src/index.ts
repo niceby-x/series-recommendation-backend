@@ -981,6 +981,78 @@ app.delete('/admin/tags/:id', async (req: Request, res: Response) => {
     res.json({ message: 'Tag deleted' });
 });
 
+// Route 9c-2b - List every series currently carrying a given tag (admin
+// only). Powers the new Moods/Tropes admin browsing screens
+// (app/admin/moods/page.tsx, app/admin/tropes/page.tsx) -- the reverse
+// direction from PATCH /admin/series/:id's tag_ids (which sets a series's
+// complete tag set); this instead starts from one tag and shows which
+// series have it, for browsing/curating a whole mood or trope at once
+// instead of hunting through individual series edits.
+app.get('/admin/tags/:id/series', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { data, error } = await supabase
+        .from('series_tags')
+        .select('series (id, title, country, year, poster_url, backdrop_url)')
+        .eq('tag_id', id);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    const series = (data || []).map((row: any) => row.series).filter(Boolean);
+
+    res.json({ message: 'Series with this tag', count: series.length, data: series });
+});
+
+// Route 9c-2c - Add one series to a tag (admin only). Body: { series_id }.
+// A single, targeted series_tags insert -- unlike PATCH /admin/series/:id's
+// tag_ids, which replaces a series's whole tag set, this only touches the
+// one tag/series pair, since the Moods/Tropes screens add series one at a
+// time from the tag's side.
+app.post('/admin/tags/:id/series', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const { series_id } = req.body || {};
+
+    if (!series_id) {
+        return res.status(400).json({ message: 'series_id is required.' });
+    }
+
+    const { error } = await supabase.from('series_tags').insert({ tag_id: id, series_id });
+
+    if (error) {
+        if (error.code === '23505') {
+            return res.status(409).json({ message: 'That series already has this tag.' });
+        }
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(201).json({ message: 'Series tagged' });
+});
+
+// Route 9c-2d - Remove one series from a tag (admin only).
+app.delete('/admin/tags/:id/series/:seriesId', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+    const seriesId = parseInt(req.params.seriesId as string);
+
+    const { error } = await supabase.from('series_tags').delete().eq('tag_id', id).eq('series_id', seriesId);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(200).json({ message: 'Series untagged' });
+});
+
 // Route 9c-4 - List every genre with how many published series use it
 // (admin only). Genres today only ever get created as a side effect of
 // approving a candidate (find-or-create by name, see the approve route
