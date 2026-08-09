@@ -2,10 +2,20 @@
 // ban/unban, delete (admin only).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
+import { validateBody } from '../../middleware/validate';
 
 const router = Router();
+
+// A2-01: same type check the old ad hoc if-checks did, declared once via zod.
+const adminFlagSchema = z.object({
+    is_admin: z.boolean({ message: 'is_admin must be a boolean.' }),
+});
+const banFlagSchema = z.object({
+    is_banned: z.boolean({ message: 'is_banned must be a boolean.' }),
+});
 
 // Route 13 - List registered users with their activity counts (admin only).
 // Ratings/watchlist counts are computed in-memory from the raw user_id
@@ -67,16 +77,12 @@ router.get('/', async (req: Request, res: Response) => {
 // this column (see requireAdmin), so demoting it here would just be
 // confusing (the Users list would show them as Member, but they'd still
 // have full access) rather than actually removing anything.
-router.patch('/:id/admin', async (req: Request, res: Response) => {
+router.patch('/:id/admin', validateBody(adminFlagSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
-    const { is_admin } = req.body || {};
-
-    if (typeof is_admin !== 'boolean') {
-        return res.status(400).json({ message: 'is_admin must be a boolean.' });
-    }
+    const { is_admin } = req.body;
 
     const { data: target, error: targetError } = await supabase
         .from('users')
@@ -114,16 +120,12 @@ router.patch('/:id/admin', async (req: Request, res: Response) => {
 // no session-revocation hook wired up for that yet. The ADMIN_EMAIL
 // account can't be banned through this route, for the same reason it
 // can't be demoted above.
-router.patch('/:id/ban', async (req: Request, res: Response) => {
+router.patch('/:id/ban', validateBody(banFlagSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
-    const { is_banned } = req.body || {};
-
-    if (typeof is_banned !== 'boolean') {
-        return res.status(400).json({ message: 'is_banned must be a boolean.' });
-    }
+    const { is_banned } = req.body;
 
     const { data: target, error: targetError } = await supabase
         .from('users')

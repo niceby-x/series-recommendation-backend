@@ -2,8 +2,11 @@
 // rename/toggle/merge/delete tags, plus per-tag series membership (admin only).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
+import { validateBody } from '../../middleware/validate';
+import { mergeIdsSchema } from './schemas';
 
 const router = Router();
 
@@ -51,24 +54,57 @@ function slugifyTagKey(label: string): string {
         .replace(/[^a-z0-9]+/g, '_')
         .replace(/^_+|_+$/g, '');
 }
+// A2-01: same checks the old ad hoc if-checks did (dimension must be one of
+// the governed values, display_label required), declared once via zod.
+const createTagSchema = z
+    .object({
+        dimension: z.string().optional(),
+        display_label: z.string().trim().optional(),
+        display_emoji: z.string().nullable().optional(),
+        value_key: z.string().optional(),
+        sort_order: z.number().optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.dimension || !VALID_TAG_DIMENSIONS.includes(val.dimension)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: 'dimension must be one of: ' + VALID_TAG_DIMENSIONS.join(', '),
+            });
+        }
+        if (!val.display_label || !val.display_label.trim()) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'display_label is required.' });
+        }
+    });
+const renameTagSchema = z
+    .object({
+        display_label: z.string().trim().optional(),
+        display_emoji: z.string().nullable().optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.display_label) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'display_label is required.' });
+        }
+    });
+const addSeriesToTagSchema = z
+    .object({
+        series_id: z.union([z.number(), z.string()]).optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.series_id) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'series_id is required.' });
+        }
+    });
 // Route 9d - Create a new tag (admin only). value_key is auto-derived from
 // display_label (Taxonomy v1's governed-vocabulary values are meant to be
 // stable snake_case keys, not admin-typed strings that could drift in
 // format) unless one is explicitly supplied. New tags are appended after
 // the current highest sort_order within their dimension by default, so
 // they show up last rather than jumping ahead of curated ordering.
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', validateBody(createTagSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const { dimension, display_label, display_emoji, value_key, sort_order } = req.body || {};
-
-    if (!VALID_TAG_DIMENSIONS.includes(dimension)) {
-        return res.status(400).json({ message: 'dimension must be one of: ' + VALID_TAG_DIMENSIONS.join(', ') });
-    }
-    if (!display_label || typeof display_label !== 'string' || !display_label.trim()) {
-        return res.status(400).json({ message: 'display_label is required.' });
-    }
+    const { dimension, display_label, display_emoji, value_key, sort_order } = req.body;
 
     const key = (value_key && String(value_key).trim()) || slugifyTagKey(display_label);
     if (!key) {
@@ -152,16 +188,12 @@ router.patch('/:id/toggle', async (req: Request, res: Response) => {
 // with another tag already in the same dimension -- that's a merge, not a
 // rename, and silently combining them would lose one tag's history of
 // which series it was actually on.
-router.patch('/:id', async (req: Request, res: Response) => {
+router.patch('/:id', validateBody(renameTagSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
-    const { display_label, display_emoji } = req.body || {};
-
-    if (!display_label || !String(display_label).trim()) {
-        return res.status(400).json({ message: 'display_label is required.' });
-    }
+    const { display_label, display_emoji } = req.body;
 
     const { data: existing, error: fetchError } = await supabase
         .from('tags')
@@ -209,18 +241,11 @@ router.patch('/:id', async (req: Request, res: Response) => {
 // All tags involved must share a dimension -- merging "Angsty" (mood) into
 // "Slow Burn" (trope) would silently misclassify every series that carried
 // the source tag, which is a bigger problem than the duplicate it fixes.
-router.post('/merge', async (req: Request, res: Response) => {
+router.post('/merge', validateBody(mergeIdsSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const targetId = parseInt(req.body?.target_id);
-    const sourceIds: number[] = (req.body?.source_ids || [])
-        .map((id: unknown) => parseInt(String(id)))
-        .filter((id: number) => !Number.isNaN(id) && id !== targetId);
-
-    if (!targetId || sourceIds.length === 0) {
-        return res.status(400).json({ message: 'target_id and at least one distinct source_id are required.' });
-    }
+    const { targetId, sourceIds } = req.body;
 
     const { data: involved, error: involvedError } = await supabase
         .from('tags')
@@ -344,16 +369,12 @@ router.get('/:id/series', async (req: Request, res: Response) => {
 // tag_ids, which replaces a series's whole tag set, this only touches the
 // one tag/series pair, since the Moods/Tropes screens add series one at a
 // time from the tag's side.
-router.post('/:id/series', async (req: Request, res: Response) => {
+router.post('/:id/series', validateBody(addSeriesToTagSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
-    const { series_id } = req.body || {};
-
-    if (!series_id) {
-        return res.status(400).json({ message: 'series_id is required.' });
-    }
+    const { series_id } = req.body;
 
     const { error } = await supabase.from('series_tags').insert({ tag_id: id, series_id });
 

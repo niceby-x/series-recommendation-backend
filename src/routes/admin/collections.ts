@@ -2,11 +2,35 @@
 // Shares fetchCollectionsJoined/loadEditableCollection with the public router.
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin, getOrCreateUserId } from '../../middleware/auth';
 import { fetchCollectionsJoined, loadEditableCollection } from '../../services/collections';
+import { validateBody } from '../../middleware/validate';
 
 const router = Router();
+
+// A2-01: same required-field checks the old ad hoc if-checks did, declared
+// once via zod.
+const createCollectionSchema = z
+    .object({
+        title: z.string().trim().optional(),
+        description: z.string().nullable().optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.title) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'title is required.' });
+        }
+    });
+const addSeriesToCollectionSchema = z
+    .object({
+        series_id: z.union([z.number(), z.string()]).optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.series_id) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'series_id is required.' });
+        }
+    });
 
 // Route 32 - Admin: list every curated collection (for app/admin/collections).
 router.get('/', async (req: Request, res: Response) => {
@@ -22,14 +46,11 @@ router.get('/', async (req: Request, res: Response) => {
 // whichever admin created it (audit only -- ownership doesn't gate access
 // the way it does for personal collections; any admin can edit any curated
 // collection, see loadEditableCollection).
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', validateBody(createCollectionSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const { title, description } = req.body || {};
-    if (!title || typeof title !== 'string' || !title.trim()) {
-        return res.status(400).json({ message: 'title is required.' });
-    }
+    const { title, description } = req.body;
 
     const authHeader = req.headers.authorization;
     const creatorUserId = await getOrCreateUserId(authHeader);
@@ -75,15 +96,12 @@ router.delete('/:id', async (req: Request, res: Response) => {
     res.status(200).json({ message: 'Collection deleted' });
 });
 // Route 36 - Admin: add a series to a curated collection. Body: { series_id }.
-router.post('/:id/series', async (req: Request, res: Response) => {
+router.post('/:id/series', validateBody(addSeriesToCollectionSchema), async (req: Request, res: Response) => {
     const id = parseInt(req.params.id as string);
     const collection = await loadEditableCollection(req, res, id, { allowCurated: true });
     if (!collection) return;
 
-    const { series_id } = req.body || {};
-    if (!series_id) {
-        return res.status(400).json({ message: 'series_id is required.' });
-    }
+    const { series_id } = req.body;
 
     let nextSortOrder = 0;
     const { data: existing } = await supabase

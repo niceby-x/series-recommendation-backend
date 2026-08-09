@@ -2,11 +2,27 @@
 // (admin only). Shares fetchCuratorPicksJoined with the public route.
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
 import { fetchCuratorPicksJoined } from '../../services/curatorPicks';
+import { validateBody } from '../../middleware/validate';
 
 const router = Router();
+
+// A2-01: same required-field check the old ad hoc if-check did, declared
+// once via zod.
+const addCuratorPickSchema = z
+    .object({
+        series_id: z.union([z.number(), z.string()]).optional(),
+        blurb: z.string().nullable().optional(),
+        is_feature: z.boolean().optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.series_id) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'series_id is required.' });
+        }
+    });
 
 // Route 21 - Admin: same data as above, for the management screen
 // (app/admin/curator-picks/page.tsx). No separate active/inactive
@@ -29,15 +45,11 @@ router.get('/', async (req: Request, res: Response) => {
 // { series_id, blurb?, is_feature? }. Only one pick can be the feature at
 // a time -- see the invariant note on Route 23 -- so is_feature: true here
 // unsets it on every other row first.
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', validateBody(addCuratorPickSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const { series_id, blurb, is_feature } = req.body || {};
-
-    if (!series_id) {
-        return res.status(400).json({ message: 'series_id is required.' });
-    }
+    const { series_id, blurb, is_feature } = req.body;
 
     if (is_feature) {
         await supabase.from('curator_picks').update({ is_feature: false }).eq('is_feature', true);

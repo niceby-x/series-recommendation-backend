@@ -1,10 +1,25 @@
 // src/routes/admin/genres.ts -- genre management: list/rename/merge/delete (admin only).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
+import { validateBody } from '../../middleware/validate';
+import { mergeIdsSchema } from './schemas';
 
 const router = Router();
+
+// A2-01: same required-field check the old ad hoc if-check did ("name is
+// required."), just declared once via zod instead of an early-return block.
+const renameGenreSchema = z
+    .object({
+        name: z.string().trim().optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.name) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'name is required.' });
+        }
+    });
 
 // Route 9c-4 - List every genre with how many published series use it
 // (admin only). Genres today only ever get created as a side effect of
@@ -35,16 +50,12 @@ router.get('/', async (req: Request, res: Response) => {
 // Route 9c-5 - Rename a genre (admin only). Same duplicate guard as tag
 // rename -- e.g. "Romance" and "romance" existing as two separate rows is
 // exactly the kind of thing this is for catching, not creating more of.
-router.patch('/:id', async (req: Request, res: Response) => {
+router.patch('/:id', validateBody(renameGenreSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
-    const { name } = req.body || {};
-
-    if (!name || !String(name).trim()) {
-        return res.status(400).json({ message: 'name is required.' });
-    }
+    const { name } = req.body;
 
     const { data: existing, error: fetchError } = await supabase.from('genres').select('id').eq('id', id).maybeSingle();
     if (fetchError) return res.status(500).json({ message: fetchError.message });
@@ -74,18 +85,11 @@ router.patch('/:id', async (req: Request, res: Response) => {
 // Route 9c-6 - Merge one or more genres into another (admin only). Same
 // repoint-skip-duplicates-then-delete pattern as tag merge. Body:
 // { source_ids: number[], target_id }.
-router.post('/merge', async (req: Request, res: Response) => {
+router.post('/merge', validateBody(mergeIdsSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const targetId = parseInt(req.body?.target_id);
-    const sourceIds: number[] = (req.body?.source_ids || [])
-        .map((id: unknown) => parseInt(String(id)))
-        .filter((id: number) => !Number.isNaN(id) && id !== targetId);
-
-    if (!targetId || sourceIds.length === 0) {
-        return res.status(400).json({ message: 'target_id and at least one distinct source_id are required.' });
-    }
+    const { targetId, sourceIds } = req.body;
 
     const { data: involved, error: involvedError } = await supabase
         .from('genres')
