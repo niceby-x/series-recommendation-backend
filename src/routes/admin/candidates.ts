@@ -368,33 +368,23 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
             .maybeSingle();
 
         if (seriesRow) {
-            // Clean up link table rows explicitly first — don't rely on ON DELETE CASCADE
-            // being configured, since we can't be sure it is.
-            const { error: genreLinkDeleteError } = await supabase
-                .from('series_genres')
-                .delete()
-                .eq('series_id', seriesRow.id);
+            // A1-01: clean up every table that references series_id first --
+            // link tables plus ratings/watchlist/curator/collection rows real
+            // users may have created -- rather than relying on ON DELETE CASCADE
+            // being configured. Same cleanupTables pattern as DELETE
+            // /admin/series/:id, so a series with real engagement can't hard-fail
+            // this restore with a raw Postgres FK-violation error.
+            const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series'];
 
-            if (genreLinkDeleteError) {
-                return res.status(500).json({ message: genreLinkDeleteError.message });
-            }
+            for (const table of cleanupTables) {
+                const { error: cleanupError } = await supabase
+                    .from(table)
+                    .delete()
+                    .eq('series_id', seriesRow.id);
 
-            const { error: castLinkDeleteError } = await supabase
-                .from('series_cast')
-                .delete()
-                .eq('series_id', seriesRow.id);
-
-            if (castLinkDeleteError) {
-                return res.status(500).json({ message: castLinkDeleteError.message });
-            }
-
-            const { error: tagLinkDeleteError } = await supabase
-                .from('series_tags')
-                .delete()
-                .eq('series_id', seriesRow.id);
-
-            if (tagLinkDeleteError) {
-                return res.status(500).json({ message: tagLinkDeleteError.message });
+                if (cleanupError) {
+                    return res.status(500).json({ message: 'Failed to clean up ' + table + ': ' + cleanupError.message });
+                }
             }
         }
 
