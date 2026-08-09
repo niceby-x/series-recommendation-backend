@@ -1,6 +1,8 @@
 import 'dotenv/config';
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { spawn, type ChildProcess } from 'child_process';
 import path from 'path';
 import { Series, Rating, ApiResponse } from './types';
@@ -8,6 +10,14 @@ import { supabase } from './services/supabase';
 
 const app = express();
 const PORT = 3001;
+
+// Sets the usual security headers (X-Content-Type-Options, X-Frame-Options,
+// Strict-Transport-Security, etc.) that a public API had none of before.
+// contentSecurityPolicy is off: CSP is a browser-facing, HTML-response
+// concern, and this is a JSON API with no HTML views to protect -- an
+// overly strict default CSP here would just add noise with nothing to
+// actually secure.
+app.use(helmet({ contentSecurityPolicy: false }));
 
 const allowedOrigins = [
   'http://localhost:3000',
@@ -26,6 +36,27 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// Rate limit writes only (GET /series is public, unauthenticated, and
+// meant to be hit on every page load -- limiting it would break normal
+// browsing). Applied as blanket middleware keyed on req.method rather than
+// attached route-by-route, so every current POST/PATCH/DELETE (there are
+// ~35 of them, admin routes included) is covered by one place, and any
+// route added later -- including once P4-04 splits this file into
+// routers -- is covered automatically instead of needing the limiter
+// re-added by hand.
+const writeRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: 'Too many requests. Please try again later.' },
+});
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.method === 'GET') return next();
+    return writeRateLimiter(req, res, next);
+});
 
 // State for the currently-running (or most recently run) TMDB discovery
 // import. The live log tail while a run is in progress stays in memory
@@ -227,10 +258,33 @@ app.get('/', (req: Request, res: Response) => {
 // real to match series against and fell back to purely positional mock
 // data. Purely additive: existing consumers that don't read `tags` are
 // unaffected.
+// Route 2 - Get all series (optionally paginated)
+//
+// Pagination is opt-in via `page`/`limit` query params rather than a
+// forced default: 12 different frontend pages currently call this route
+// expecting the full catalog back (they do their own client-side
+// filtering/sorting over it), and none of them are in scope here -- so an
+// unrequested default limit would silently truncate every one of those
+// pages, which isn't something this task should do as a side effect.
+// Passing `page`/`limit` genuinely paginates via Supabase's .range() and
+// returns a `pagination` block; omitting them preserves today's full-list
+// behavior exactly.
 app.get('/series', async (req: Request, res: Response) => {
-    const { data, error } = await supabase
-    .from('series')
-    .select('*, series_tags (tags (id, dimension, value_key, display_label, display_emoji))');
+    const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
+
+    let query = supabase
+        .from('series')
+        .select('*, series_tags (tags (id, dimension, value_key, display_label, display_emoji)), series_genres (genres (name))', hasPagination ? { count: 'exact' } : {});
+
+    if (hasPagination) {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        query = query.range(from, to);
+    }
+
+    const { data, error, count } = await query;
 
     if (error) {
         return res.status(500).json({ message: error.message});
@@ -277,23 +331,33 @@ app.get('/series', async (req: Request, res: Response) => {
     }
 
     const flattened = data.map((row: any) => {
-        const { series_tags, ...rest } = row;
+        const { series_tags, series_genres, ...rest } = row;
         const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
+        const genre_names = (series_genres || []).map((g: any) => g.genres?.name).filter(Boolean);
         const scores = ratingsBySeries.get(row.id) || [];
         const average_rating = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
         return {
             ...rest,
             tags,
+            genre_names,
             collection_ids: collectionIdsBySeries.get(row.id) || [],
             average_rating,
             rating_count: scores.length,
         };
     });
 
-    const response: ApiResponse<Series[]> = {
+    const response: ApiResponse<Series[]> & { pagination?: { page: number; limit: number; total: number; has_more: boolean } } = {
         message: 'List of BL Series',
         count: flattened.length,
-        data: flattened
+        data: flattened,
+        ...(hasPagination && {
+            pagination: {
+                page,
+                limit,
+                total: count ?? flattened.length,
+                has_more: page * limit < (count ?? 0),
+            },
+        }),
     };
 
     res.json(response);
