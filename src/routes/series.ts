@@ -30,9 +30,28 @@ router.get('/', async (req: Request, res: Response) => {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
 
+    // P2-05: tags, genres, ratings, and curated-collection membership are
+    // all pulled in as nested embeds on this one query, instead of the
+    // four separate round trips this route used to make (main query +
+    // curated-collection-ids query + collection_series-memberships query +
+    // ratings query). collection_series -> series and
+    // collection_series -> collections are both FK-backed (see
+    // migrations/004_collections_tables.sql) -- same relationship
+    // GET /series/:id below already embeds successfully, just walked from
+    // the other direction (series -> collection_series -> collections
+    // instead of collection_series -> collections directly), which is why
+    // a single .select() can pull it in here too, filtered client-side to
+    // is_curated afterward.
     let query = supabase
         .from('series')
-        .select('*, series_tags (tags (id, dimension, value_key, display_label, display_emoji)), series_genres (genres (name))', hasPagination ? { count: 'exact' } : {});
+        .select(
+            `*,
+            series_tags (tags (id, dimension, value_key, display_label, display_emoji)),
+            series_genres (genres (name)),
+            ratings (score),
+            collection_series (collection_id, collections (is_curated))`,
+            hasPagination ? { count: 'exact' } : {}
+        );
 
     if (hasPagination) {
         const from = (page - 1) * limit;
@@ -43,60 +62,26 @@ router.get('/', async (req: Request, res: Response) => {
     const { data, error, count } = await query;
 
     if (error) {
-        return res.status(500).json({ message: error.message});
-    }
-
-    // Curated-collection membership per series, for SeriesEditModal's
-    // Collections picker (mirrors tag_ids/genre_names in spirit -- though
-    // unlike those two, this is actually populated below rather than left
-    // for the frontend to default to empty). Two small queries (curated
-    // collection ids, then their memberships) rather than a nested filter
-    // through the join table, since supabase-js can't filter a nested
-    // relation's own relation in one .select() call.
-    const { data: curatedCollections } = await supabase.from('collections').select('id').eq('is_curated', true);
-    const curatedIds = (curatedCollections || []).map((c) => c.id);
-
-    const collectionIdsBySeries = new Map<number, number[]>();
-    if (curatedIds.length > 0) {
-        const { data: memberships } = await supabase
-            .from('collection_series')
-            .select('series_id, collection_id')
-            .in('collection_id', curatedIds);
-        for (const row of memberships || []) {
-            const list = collectionIdsBySeries.get(row.series_id) || [];
-            list.push(row.collection_id);
-            collectionIdsBySeries.set(row.series_id, list);
-        }
-    }
-
-    // Real average_rating/rating_count per series, computed from actual
-    // `ratings` rows -- same aggregation getCuratorPicksData() already does
-    // for the homepage's Curator's Picks section. Previously nothing here
-    // read the ratings table at all, so every card fell back to the
-    // hardcoded REAL_TRENDING_OVERRIDES/mock rating helpers regardless of
-    // what anyone had actually rated.
-    const seriesIds = data.map((row: any) => row.id);
-    const ratingsBySeries = new Map<number, number[]>();
-    if (seriesIds.length > 0) {
-        const { data: ratingsRows } = await supabase.from('ratings').select('series_id, score').in('series_id', seriesIds);
-        for (const row of ratingsRows || []) {
-            const list = ratingsBySeries.get(row.series_id) || [];
-            list.push(row.score);
-            ratingsBySeries.set(row.series_id, list);
-        }
+        return res.status(500).json({ message: error.message });
     }
 
     const flattened = data.map((row: any) => {
-        const { series_tags, series_genres, ...rest } = row;
+        const { series_tags, series_genres, ratings, collection_series, ...rest } = row;
         const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
         const genre_names = (series_genres || []).map((g: any) => g.genres?.name).filter(Boolean);
-        const scores = ratingsBySeries.get(row.id) || [];
-        const average_rating = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : null;
+        const scores = (ratings || []).map((r: any) => r.score);
+        const average_rating = scores.length > 0 ? scores.reduce((a: number, b: number) => a + b, 0) / scores.length : null;
+        // Only curated collections belong in collection_ids here -- same
+        // scope as the old two-query version (personal collections were
+        // never included), just filtered in JS instead of a second query.
+        const collection_ids = (collection_series || [])
+            .filter((cs: any) => cs.collections?.is_curated)
+            .map((cs: any) => cs.collection_id);
         return {
             ...rest,
             tags,
             genre_names,
-            collection_ids: collectionIdsBySeries.get(row.id) || [],
+            collection_ids,
             average_rating,
             rating_count: scores.length,
         };
