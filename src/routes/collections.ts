@@ -2,11 +2,35 @@
 // manage your own; admin-curated management lives in routes/admin/collections.ts).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../services/supabase';
 import { getOrCreateUserId } from '../middleware/auth';
+import { validateBody } from '../middleware/validate';
 import { fetchCollectionsJoined, loadEditableCollection } from '../services/collections';
 
 const router = Router();
+
+// P2-03: schemas for this router's three body-carrying routes, replacing
+// the ad hoc if-checks each one had. Kept the same error messages and the
+// same "trim, empty string counts as missing" behavior POST / already had.
+const createCollectionSchema = z.object({
+    title: z
+        .string({ error: 'title is required.' })
+        .trim()
+        .min(1, 'title is required.'),
+    description: z.string().nullable().optional(),
+});
+
+// PATCH allows a partial update (title/description each optional), but if
+// title is provided it can't be blank -- same as create.
+const updateCollectionSchema = z.object({
+    title: z.string().trim().min(1, 'title is required.').optional(),
+    description: z.string().nullable().optional(),
+});
+
+const addSeriesToCollectionSchema = z.object({
+    series_id: z.number({ error: 'series_id is required.' }),
+});
 
 // Route 25 - Public: browse collections. ?mine=true (auth required) returns
 // only the caller's own personal collections; otherwise returns every
@@ -76,20 +100,17 @@ router.get('/:id', async (req: Request, res: Response) => {
 // Route 27 - Create a personal collection (auth required). Always
 // is_curated: false, owner_user_id: the caller -- curated collections are
 // only created through POST /admin/collections below.
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', validateBody(createCollectionSchema), async (req: Request, res: Response) => {
     const userId = await getOrCreateUserId(req.headers.authorization);
     if (userId === null) {
         return res.status(401).json({ message: 'You must be signed in to create a collection.' });
     }
 
-    const { title, description } = req.body || {};
-    if (!title || typeof title !== 'string' || !title.trim()) {
-        return res.status(400).json({ message: 'title is required.' });
-    }
+    const { title, description } = req.body;
 
     const { data, error } = await supabase
         .from('collections')
-        .insert({ title: title.trim(), description: description || null, is_curated: false, owner_user_id: userId })
+        .insert({ title, description: description || null, is_curated: false, owner_user_id: userId })
         .select()
         .single();
 
@@ -100,12 +121,12 @@ router.post('/', async (req: Request, res: Response) => {
     res.status(201).json({ message: 'Collection created', data });
 });
 // Route 28 - Rename/redescribe a personal collection (owner only).
-router.patch('/:id', async (req: Request, res: Response) => {
+router.patch('/:id', validateBody(updateCollectionSchema), async (req: Request, res: Response) => {
     const id = parseInt(req.params.id as string);
     const collection = await loadEditableCollection(req, res, id, { allowCurated: false });
     if (!collection) return;
 
-    const { title, description } = req.body || {};
+    const { title, description } = req.body;
     const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (title !== undefined) update.title = title;
     if (description !== undefined) update.description = description;
@@ -136,15 +157,12 @@ router.delete('/:id', async (req: Request, res: Response) => {
 });
 // Route 30 - Add a series to a personal collection (owner only). Body:
 // { series_id }.
-router.post('/:id/series', async (req: Request, res: Response) => {
+router.post('/:id/series', validateBody(addSeriesToCollectionSchema), async (req: Request, res: Response) => {
     const id = parseInt(req.params.id as string);
     const collection = await loadEditableCollection(req, res, id, { allowCurated: false });
     if (!collection) return;
 
-    const { series_id } = req.body || {};
-    if (!series_id) {
-        return res.status(400).json({ message: 'series_id is required.' });
-    }
+    const { series_id } = req.body;
 
     let nextSortOrder = 0;
     const { data: existing } = await supabase

@@ -1,13 +1,28 @@
 // src/routes/watchlist.ts -- personal watchlist CRUD (auth required).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../services/supabase';
 import { getOrCreateUserId } from '../middleware/auth';
+import { validateBody } from '../middleware/validate';
 
 const router = Router();
 
+const WATCHLIST_STATUSES = ['plan_to_watch', 'watching', 'completed'] as const;
+
+// P2-03: same series_id/status-enum check the old ad hoc if-check did,
+// same error message, just declared once as a schema.
+const upsertWatchlistSchema = z.object({
+    series_id: z.number({
+        error: `series_id and a valid status (${WATCHLIST_STATUSES.join(', ')}) are required`,
+    }),
+    status: z.enum(WATCHLIST_STATUSES, {
+        error: `series_id and a valid status (${WATCHLIST_STATUSES.join(', ')}) are required`,
+    }),
+});
+
 // Route 5 - Add or update a watchlist entry (upsert)
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', validateBody(upsertWatchlistSchema), async (req: Request, res: Response) => {
     const { series_id, status } = req.body;
 
     const user_id = await getOrCreateUserId(req.headers.authorization);
@@ -15,14 +30,6 @@ router.post('/', async (req: Request, res: Response) => {
     if (!user_id) {
         return res.status(401).json({
             message: 'You must be signed in to update your watchlist'
-        });
-    }
-
-    const validStatuses = ['plan_to_watch', 'watching', 'completed'];
-
-    if (!series_id || !status || !validStatuses.includes(status)) {
-        return res.status(400).json({
-            message: 'series_id and a valid status (' + validStatuses.join(', ') + ') are required'
         });
     }
 

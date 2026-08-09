@@ -1,0 +1,32 @@
+name: CI
+
+# P3-07: at minimum a build/typecheck step on every push/PR. No lint config
+# exists in this repo yet (no .eslintrc/eslint.config.*), so this doesn't
+# add a lint step -- adding ESLint from scratch is its own task, not
+# something to fold in silently here. No test step either, per this task's
+# own note: package.json's test script is still a placeholder (see P4-06).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck / build
+        run: npm run build

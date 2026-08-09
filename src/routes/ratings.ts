@@ -1,9 +1,11 @@
 // src/routes/ratings.ts -- submit/read ratings (auth required).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../services/supabase';
 import { Rating, ApiResponse } from '../types';
 import { getOrCreateUserId } from '../middleware/auth';
+import { validateBody } from '../middleware/validate';
 
 const router = Router();
 
@@ -15,9 +17,31 @@ const router = Router();
 // to inherit this from.
 const REVIEW_TEXT_MAX_LENGTH = 2000;
 
+// P2-03: same validation the old ad hoc if-checks did (series_id + score
+// required, score 1-10, review_text capped), just declared once instead
+// of three separate early-return blocks. Kept the exact same error
+// messages so this is a behavior-preserving swap for any existing caller.
+const submitRatingSchema = z
+    .object({
+        series_id: z.number().optional(),
+        score: z.number().optional(),
+        review_text: z
+            .string()
+            .max(REVIEW_TEXT_MAX_LENGTH, `review_text must be ${REVIEW_TEXT_MAX_LENGTH} characters or fewer`)
+            .nullable()
+            .optional(),
+    })
+    .superRefine((val, ctx) => {
+        if (!val.series_id || !val.score) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'series_id and score are required' });
+        } else if (val.score < 1 || val.score > 10) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Score must be between 1 and 10' });
+        }
+    });
+
 // Route 4 - Submit a rating (upsert -- resubmitting for a series you've
 // already rated updates that row instead of creating a duplicate one).
-router.post('/', async (req: Request, res: Response) => {
+router.post('/', validateBody(submitRatingSchema), async (req: Request, res: Response) => {
     const { series_id, score, review_text } = req.body;
 
     const user_id = await getOrCreateUserId(req.headers.authorization);
@@ -25,24 +49,6 @@ router.post('/', async (req: Request, res: Response) => {
     if (!user_id) {
         return res.status(401).json({
             message: 'You must be signed in to submit a rating'
-        });
-    }
-
-    if (!series_id || !score) {
-        return res.status(400).json({
-            message: 'series_id and score are required'
-        });
-    }
-
-    if (score < 1 || score > 10) {
-        return res.status(400).json({
-            message: 'Score must be between 1 and 10'
-        });
-    }
-
-    if (typeof review_text === 'string' && review_text.length > REVIEW_TEXT_MAX_LENGTH) {
-        return res.status(400).json({
-            message: `review_text must be ${REVIEW_TEXT_MAX_LENGTH} characters or fewer`
         });
     }
 
