@@ -3,8 +3,11 @@ name: CI
 # P3-07: at minimum a build/typecheck step on every push/PR. No lint config
 # exists in this repo yet (no .eslintrc/eslint.config.*), so this doesn't
 # add a lint step -- adding ESLint from scratch is its own task, not
-# something to fold in silently here. No test step either, per this task's
-# own note: package.json's test script is still a placeholder (see P4-06).
+# something to fold in silently here.
+# F-01: package.json's test script is no longer a placeholder -- P4-06 added
+# real vitest coverage for ratings/series/collections/watchlist, so this now
+# runs it. Supabase and auth are mocked in those tests, so no DB or secrets
+# are needed here.
 on:
   push:
     branches: [main]
@@ -30,3 +33,6 @@ jobs:
 
       - name: Typecheck / build
         run: npm run build
+
+      - name: Run tests
+        run: npm test
