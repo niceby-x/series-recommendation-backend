@@ -23,17 +23,45 @@ const banFlagSchema = z.object({
 // correctly at this app's current scale, no RPC/view needed. If the users
 // table grows large enough for this to matter, switch to a `.rpc()` call
 // against a SQL aggregate instead of adding pagination band-aids here.
+// A2-03: pagination is opt-in via page/limit, same convention P2-04 used for
+// GET /series -- omitting them preserves today's full-list behavior exactly.
+// Independent of whether pagination is requested, the ratings/user_lists
+// count queries are now scoped to just the user ids actually being
+// returned (`.in('user_id', userIds)`) instead of pulling every row in
+// both tables regardless of how many users are on the page -- that's the
+// bigger of the two problems this task called out, and fixing it doesn't
+// depend on the caller having adopted the new paginated response shape.
 router.get('/', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    const [usersRes, ratingsRes, listsRes] = await Promise.all([
-        supabase.from('users').select('id, email, username, created_at, is_admin, is_banned').order('created_at', { ascending: false }),
-        supabase.from('ratings').select('user_id'),
-        supabase.from('user_lists').select('user_id'),
-    ]);
+    const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
 
-    if (usersRes.error) return res.status(500).json({ message: usersRes.error.message });
+    let usersQuery = supabase
+        .from('users')
+        .select('id, email, username, created_at, is_admin, is_banned', hasPagination ? { count: 'exact' } : {})
+        .order('created_at', { ascending: false });
+
+    if (hasPagination) {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        usersQuery = usersQuery.range(from, to);
+    }
+
+    const { data: users, error: usersError, count } = await usersQuery;
+    if (usersError) return res.status(500).json({ message: usersError.message });
+
+    const userIds = users.map((u) => u.id);
+
+    const [ratingsRes, listsRes] = userIds.length > 0
+        ? await Promise.all([
+            supabase.from('ratings').select('user_id').in('user_id', userIds),
+            supabase.from('user_lists').select('user_id').in('user_id', userIds),
+        ])
+        : [{ data: [], error: null }, { data: [], error: null }];
+
     if (ratingsRes.error) return res.status(500).json({ message: ratingsRes.error.message });
     if (listsRes.error) return res.status(500).json({ message: listsRes.error.message });
 
@@ -52,7 +80,7 @@ router.get('/', async (req: Request, res: Response) => {
     // is_admin here is the real column now, OR'd with the ADMIN_EMAIL
     // bootstrap match -- so the owner's account always shows correctly as
     // Admin even in the moment before requireAdmin's self-heal has run.
-    const data = usersRes.data.map((u) => ({
+    const data = users.map((u) => ({
         ...u,
         ratings_count: ratingsCountByUser.get(u.id) || 0,
         watchlist_count: watchlistCountByUser.get(u.id) || 0,
@@ -68,7 +96,15 @@ router.get('/', async (req: Request, res: Response) => {
     res.json({
         message: 'Users',
         count: data.length,
-        data
+        data,
+        ...(hasPagination && {
+            pagination: {
+                page,
+                limit,
+                total: count ?? data.length,
+                has_more: page * limit < (count ?? 0),
+            },
+        }),
     });
 });
 // Route 13b - Promote/demote a user's admin status (admin only). Body:

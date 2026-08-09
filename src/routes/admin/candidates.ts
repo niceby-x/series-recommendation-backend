@@ -9,6 +9,10 @@ const router = Router();
 
 // Route 9 - List TMDB import candidates by review status (admin only).
 // Defaults to 'pending'; pass ?status=approved or ?status=rejected for the history views.
+// A2-03: pagination is opt-in via page/limit, same convention P2-04 used for
+// GET /series -- omitting them preserves today's full-queue-in-one-shot
+// behavior exactly, since it's not known here whether every admin caller of
+// this route has been updated to expect a paginated shape.
 router.get('/', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
@@ -17,15 +21,27 @@ router.get('/', async (req: Request, res: Response) => {
     const statusParam = typeof req.query.status === 'string' ? req.query.status : 'pending';
     const status = validStatuses.includes(statusParam) ? statusParam : 'pending';
 
+    const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
+
     // Pending candidates are shown oldest-first (a queue to work through);
     // approved/rejected history is shown most-recent-first (what you just did).
     const ascending = status === 'pending';
 
-    const { data, error } = await supabase
+    let query = supabase
         .from('series_candidates')
-        .select('*, series_candidate_tags (tag_id)')
+        .select('*, series_candidate_tags (tag_id)', hasPagination ? { count: 'exact' } : {})
         .eq('review_status', status)
         .order('created_at', { ascending });
+
+    if (hasPagination) {
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+        query = query.range(from, to);
+    }
+
+    const { data, error, count } = await query;
 
     if (error) {
         return res.status(500).json({ message: error.message });
@@ -42,7 +58,15 @@ router.get('/', async (req: Request, res: Response) => {
     res.json({
         message: status.charAt(0).toUpperCase() + status.slice(1) + ' candidates',
         count: flattened.length,
-        data: flattened
+        data: flattened,
+        ...(hasPagination && {
+            pagination: {
+                page,
+                limit,
+                total: count ?? flattened.length,
+                has_more: page * limit < (count ?? 0),
+            },
+        }),
     });
 });
 // Route 9b - Lightweight counts for all three review statuses at once (admin only).
