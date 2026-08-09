@@ -323,20 +323,69 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
 
     res.status(200).json({ message: 'Approved and added to catalog' });
 });
-// Route 11 - Reject a candidate: just marks it rejected, never touches `series` (admin only)
+// Route 11 - Reject a candidate (admin only). A1-02: if it was previously
+// approved, this also removes the corresponding row from `series` first --
+// same as restore below -- so a rejected candidate can't leave an orphaned,
+// unreviewable title live in the public catalog.
 router.post('/:id/reject', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
     const id = parseInt(req.params.id as string);
 
-    const { error } = await supabase
+    const { data: candidate, error: fetchError } = await supabase
+        .from('series_candidates')
+        .select('*')
+        .eq('id', id)
+        .single();
+
+    if (fetchError || !candidate) {
+        return res.status(404).json({ message: 'Candidate not found' });
+    }
+
+    if (candidate.review_status === 'approved') {
+        const { data: seriesRow } = await supabase
+            .from('series')
+            .select('id')
+            .eq('tmdb_id', candidate.tmdb_id)
+            .maybeSingle();
+
+        if (seriesRow) {
+            // Same cleanupTables pattern as restore below and DELETE
+            // /admin/series/:id -- clean up every table that references
+            // series_id before the delete, rather than relying on
+            // ON DELETE CASCADE being configured.
+            const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series'];
+
+            for (const table of cleanupTables) {
+                const { error: cleanupError } = await supabase
+                    .from(table)
+                    .delete()
+                    .eq('series_id', seriesRow.id);
+
+                if (cleanupError) {
+                    return res.status(500).json({ message: 'Failed to clean up ' + table + ': ' + cleanupError.message });
+                }
+            }
+        }
+
+        const { error: deleteError } = await supabase
+            .from('series')
+            .delete()
+            .eq('tmdb_id', candidate.tmdb_id);
+
+        if (deleteError) {
+            return res.status(500).json({ message: deleteError.message });
+        }
+    }
+
+    const { error: updateError } = await supabase
         .from('series_candidates')
         .update({ review_status: 'rejected' })
         .eq('id', id);
 
-    if (error) {
-        return res.status(500).json({ message: error.message });
+    if (updateError) {
+        return res.status(500).json({ message: updateError.message });
     }
 
     res.status(200).json({ message: 'Rejected' });
