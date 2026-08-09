@@ -7,6 +7,14 @@ import { getOrCreateUserId } from '../middleware/auth';
 
 const router = Router();
 
+// P2-08: shared cap on review_text length, enforced here (server-side) and
+// meant to be mirrored on the frontend's textarea maxLength so the two
+// can't drift apart -- see the handoff note. 2000 chars is generous for a
+// real review (roughly 300-400 words) while still keeping payloads and
+// row sizes sane; there was no existing DB column limit or prior convention
+// to inherit this from.
+const REVIEW_TEXT_MAX_LENGTH = 2000;
+
 // Route 4 - Submit a rating (upsert -- resubmitting for a series you've
 // already rated updates that row instead of creating a duplicate one).
 router.post('/', async (req: Request, res: Response) => {
@@ -29,6 +37,12 @@ router.post('/', async (req: Request, res: Response) => {
     if (score < 1 || score > 10) {
         return res.status(400).json({
             message: 'Score must be between 1 and 10'
+        });
+    }
+
+    if (typeof review_text === 'string' && review_text.length > REVIEW_TEXT_MAX_LENGTH) {
+        return res.status(400).json({
+            message: `review_text must be ${REVIEW_TEXT_MAX_LENGTH} characters or fewer`
         });
     }
 
