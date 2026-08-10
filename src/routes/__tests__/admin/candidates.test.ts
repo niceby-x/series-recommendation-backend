@@ -112,7 +112,7 @@ describe('POST /admin/candidates/:id/reject (A1-02)', () => {
         queue('series_candidates', { data: { id: 1, review_status: 'approved', tmdb_id: 555 }, error: null });
         queue('series', { data: { id: 42 }, error: null }); // series lookup by tmdb_id
         // cleanupTables loop -- one queued success per table, in the exact order the route deletes them
-        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series']) {
+        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots']) {
             queue(table, { data: null, error: null });
         }
         queue('series', { data: null, error: null }); // the series delete itself
@@ -152,7 +152,7 @@ describe('POST /admin/candidates/:id/restore (A1-01)', () => {
     it('cleans up ratings/user_lists/curator_picks/collection_series before deleting the series, then restores to pending', async () => {
         queue('series_candidates', { data: { id: 1, review_status: 'approved', tmdb_id: 555 }, error: null });
         queue('series', { data: { id: 42 }, error: null });
-        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series']) {
+        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots']) {
             queue(table, { data: null, error: null });
         }
         queue('series', { data: null, error: null });

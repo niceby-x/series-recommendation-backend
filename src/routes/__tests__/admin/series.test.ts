@@ -166,7 +166,7 @@ describe('DELETE /admin/series/:id', () => {
     });
 
     it('cleans up every dependent table before deleting the series', async () => {
-        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series']) {
+        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots']) {
             queue(table, { data: null, error: null });
         }
         queue('series', { data: null, error: null });

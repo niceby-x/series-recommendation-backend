@@ -21,6 +21,7 @@ import adminImportRunsRouter from './routes/admin/importRuns';
 import adminSeriesRouter from './routes/admin/series';
 import adminCuratorPicksRouter from './routes/admin/curatorPicks';
 import adminCollectionsRouter from './routes/admin/collections';
+import adminRankSnapshotsRouter from './routes/admin/rankSnapshots';
 
 const app = express();
 const PORT = 3001;
@@ -103,6 +104,7 @@ app.use('/admin/import', adminImportRunsRouter);
 app.use('/admin/series', adminSeriesRouter);
 app.use('/admin/curator-picks', adminCuratorPicksRouter);
 app.use('/admin/collections', adminCollectionsRouter);
+app.use('/admin/rank-snapshots', adminRankSnapshotsRouter);
 
 app.listen(PORT, () => {
     console.log(`BL Series API is running at http://localhost:${PORT}`);

@@ -3,6 +3,7 @@
 import { Router, Request, Response } from 'express';
 import { supabase } from '../services/supabase';
 import { Series, ApiResponse } from '../types';
+import { getRankTrends } from '../services/rankSnapshots';
 
 const router = Router();
 
@@ -65,6 +66,13 @@ router.get('/', async (req: Request, res: Response) => {
         return res.status(500).json({ message: error.message });
     }
 
+    // H2-01: real week-over-week trend data, replacing the frontend's
+    // hardcoded TRENDS array. A series with no snapshot yet (job never
+    // run, or too new/unrated to have been ranked) gets rank: null,
+    // rank_trend: null rather than a fabricated 'flat' -- callers should
+    // treat null as "no trend data," not as "unchanged."
+    const rankTrends = await getRankTrends();
+
     const flattened = data.map((row: any) => {
         const { series_tags, series_genres, ratings, collection_series, ...rest } = row;
         const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
@@ -77,6 +85,7 @@ router.get('/', async (req: Request, res: Response) => {
         const collection_ids = (collection_series || [])
             .filter((cs: any) => cs.collections?.is_curated)
             .map((cs: any) => cs.collection_id);
+        const rankTrend = rankTrends.get(row.id);
         return {
             ...rest,
             tags,
@@ -84,6 +93,8 @@ router.get('/', async (req: Request, res: Response) => {
             collection_ids,
             average_rating,
             rating_count: scores.length,
+            rank: rankTrend?.rank ?? null,
+            rank_trend: rankTrend?.trend ?? null,
         };
     });
 

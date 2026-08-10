@@ -27,6 +27,14 @@ vi.mock('../../services/supabase', () => ({
     },
 }));
 
+// H2-01: GET /series merges in rank/rank_trend via this service, which
+// hits supabase itself -- mocked separately from the generic supabase
+// mock above (same reasoning as mocking services/curatorPicks in the
+// admin curator-picks tests) so these tests can control trend data
+// per-case without it colliding with the ratings/tags/genres query mock.
+const { getRankTrendsMock } = vi.hoisted(() => ({ getRankTrendsMock: vi.fn() }));
+vi.mock('../../services/rankSnapshots', () => ({ getRankTrends: getRankTrendsMock }));
+
 import seriesRouter from '../series';
 
 function buildApp() {
@@ -49,6 +57,10 @@ function mockSelectResult(result: { data: any[]; error: null; count?: number | n
 describe('GET /series', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        // Default: no snapshot data, so existing tests (written before
+        // H2-01) get rank: null / rank_trend: null without having to
+        // know about the rank-trends service themselves.
+        getRankTrendsMock.mockResolvedValue(new Map());
     });
 
     it('flattens tags, genre_names, ratings, and curated-only collection_ids', async () => {
@@ -113,6 +125,39 @@ describe('GET /series', () => {
         expect(series.average_rating).toBeNull();
         expect(series.rating_count).toBe(0);
         expect(series.collection_ids).toEqual([]);
+    });
+
+    it('sets rank and rank_trend to null when the rank-snapshot job has never run for a series (H2-01)', async () => {
+        mockSelectResult({
+            data: [{ id: 3, title: 'No Snapshot Yet', series_tags: [], series_genres: [], ratings: [], collection_series: [] }],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series');
+
+        expect(res.body.data[0].rank).toBeNull();
+        expect(res.body.data[0].rank_trend).toBeNull();
+    });
+
+    it('merges rank and rank_trend from getRankTrends by series id (H2-01)', async () => {
+        getRankTrendsMock.mockResolvedValue(new Map([
+            [1, { rank: 2, trend: 'up' }],
+            [2, { rank: 5, trend: 'new' }],
+        ]));
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'Climbing Series', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+                { id: 2, title: 'Newly Ranked Series', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+                { id: 3, title: 'Untracked Series', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series');
+
+        expect(res.body.data[0]).toMatchObject({ rank: 2, rank_trend: 'up' });
+        expect(res.body.data[1]).toMatchObject({ rank: 5, rank_trend: 'new' });
+        expect(res.body.data[2]).toMatchObject({ rank: null, rank_trend: null });
     });
 
     it('returns a pagination block only when page/limit are provided', async () => {

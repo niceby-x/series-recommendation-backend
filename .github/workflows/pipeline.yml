@@ -2,9 +2,10 @@ name: Data Pipeline
 
 # Automates the routine, non-destructive scripts that just keep the
 # catalog's data quality up (filling in season counts/animated flags,
-# filling in missing posters/backdrops). Runs nightly, and can also be
-# triggered manually from the Actions tab to verify credentials or run it
-# on demand without waiting for the schedule.
+# filling in missing posters/backdrops, computing the daily rank
+# snapshot for Home's Trending arrows -- H2-01). Runs nightly, and can
+# also be triggered manually from the Actions tab to verify credentials
+# or run it on demand without waiting for the schedule.
 #
 # Deliberately does NOT include bulk-add-series.ts, backfill-backdrops.ts,
 # or fix-missing-posters.ts -- those touch a lot of rows at once and are
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  enrich-and-fetch-posters:
+  enrich-fetch-posters-and-rank:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -51,3 +52,17 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
         run: node --import tsx src/scripts/fetch-posters.ts
+
+      # Also independent of the two steps above -- ranking is driven by
+      # the ratings table, not by anything either enrichment step
+      # touches. Same always-run reasoning: one step's failure shouldn't
+      # cost the day's rank snapshot too, since a missed day just means
+      # tomorrow's comparison spans two days instead of one (see
+      # getRankTrends' "most recent prior date" comparison, not a fixed
+      # one-day lookback).
+      - name: Compute rank snapshot (H2-01)
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: node --import tsx src/scripts/compute-rank-snapshot.ts

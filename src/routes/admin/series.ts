@@ -264,7 +264,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
     const id = parseInt(req.params.id as string);
 
-    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series'];
+    const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots'];
 
     for (const table of cleanupTables) {
         const { error } = await supabase.from(table).delete().eq('series_id', id);

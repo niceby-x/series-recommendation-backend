@@ -40,8 +40,9 @@ later files sometimes depend on tables/columns earlier ones create (e.g.
 | 004 | `004_collections_tables.sql` | Creates `collections`, `collection_series` | `/collections`, `/admin/collections` |
 | 005 | `005_ratings_unique_constraint.sql` | Adds unique `(user_id, series_id)` on `ratings` | `POST /ratings` upsert (P1-05) |
 | 006 | `006_admin_actions_table.sql` | Creates `admin_actions` | Audit logging in `/admin/users` (promote/demote, ban/unban, delete) and `/admin/candidates` (approve/reject/restore) (A2-02) |
+| 007 | `007_series_rank_snapshots.sql` | Creates `series_rank_snapshots` | `POST /admin/rank-snapshots/run`, `GET /series`'s `rank`/`rank_trend` fields (H2-01) |
 
-All six are assumed already applied to production as of this README --
-this table exists so the next migration (`007_...`) has a clear number to
+All seven are assumed already applied to production as of this README --
+this table exists so the next migration (`008_...`) has a clear number to
 follow and a place to log itself, not because any of these are still
 pending.

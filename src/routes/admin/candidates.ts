@@ -406,7 +406,7 @@ router.post('/:id/reject', async (req: Request, res: Response) => {
             // /admin/series/:id -- clean up every table that references
             // series_id before the delete, rather than relying on
             // ON DELETE CASCADE being configured.
-            const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series'];
+            const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots'];
 
             for (const table of cleanupTables) {
                 const { error: cleanupError } = await supabase
@@ -476,7 +476,7 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
             // being configured. Same cleanupTables pattern as DELETE
             // /admin/series/:id, so a series with real engagement can't hard-fail
             // this restore with a raw Postgres FK-violation error.
-            const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series'];
+            const cleanupTables = ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots'];
 
             for (const table of cleanupTables) {
                 const { error: cleanupError } = await supabase

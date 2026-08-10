@@ -31,6 +31,12 @@ export interface Series {
     // not on a raw row from `series` itself.
     tags?: SeriesTag[];
     tag_ids?: number[];
+    // H2-01: real week-over-week popularity rank, present on GET /series
+    // when the rank-snapshot job (POST /admin/rank-snapshots/run) has
+    // run for this series. null if the job hasn't been run yet, or the
+    // series has no ratings to rank -- not "unchanged."
+    rank?: number | null;
+    rank_trend?: 'up' | 'down' | 'flat' | 'new' | null;
 }
 
 export interface Rating {
