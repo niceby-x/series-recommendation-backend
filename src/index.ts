@@ -10,6 +10,7 @@ import ratingsRouter from './routes/ratings';
 import watchlistRouter from './routes/watchlist';
 import curatorPicksRouter from './routes/curatorPicks';
 import collectionsRouter from './routes/collections';
+import meRouter from './routes/me';
 
 import adminCandidatesRouter from './routes/admin/candidates';
 import adminTagsRouter from './routes/admin/tags';
@@ -89,6 +90,7 @@ app.use('/ratings', ratingsRouter);
 app.use('/watchlist', watchlistRouter);
 app.use('/curator-picks', curatorPicksRouter);
 app.use('/collections', collectionsRouter);
+app.use('/me', meRouter);
 
 // Admin routers (all gated by requireAdmin inside each route -- see
 // middleware/auth.ts).
