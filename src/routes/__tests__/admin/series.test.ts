@@ -40,6 +40,63 @@ describe('PATCH /admin/series/:id', () => {
         expect(res.status).toBe(403);
     });
 
+    it('rejects an invalid status with 400 instead of letting a raw Postgres constraint error through', async () => {
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ status: 'cancelled' }); // not one of airing/completed/upcoming
+
+        expect(res.status).toBe(400);
+    });
+
+    it('rejects a non-numeric year with 400', async () => {
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ year: '2020' });
+
+        expect(res.status).toBe(400);
+    });
+
+    it('rejects a blank title with 400', async () => {
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ title: '   ' });
+
+        expect(res.status).toBe(400);
+    });
+
+    it('accepts a valid status value', async () => {
+        queue('series', { data: null, error: null });
+
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ status: 'upcoming' });
+
+        expect(res.status).toBe(200);
+    });
+
+    it('rejects a taxonomy field value outside the Taxonomy v1 enum with 400', async () => {
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ content_level: 'explicit' }); // deliberately withheld from v1, see the spec
+
+        expect(res.status).toBe(400);
+    });
+
+    it('accepts valid Taxonomy v1 enum values, including null to clear a nullable field', async () => {
+        queue('series', { data: null, error: null });
+
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({
+                romance_pace: 'established_relationship',
+                emotional_intensity: null,
+                ending_type: 'open',
+                content_level: 'sweet',
+            });
+
+        expect(res.status).toBe(200);
+    });
+
     it('updates only the editable fields present in the body', async () => {
         queue('series', { data: null, error: null }); // the update
 

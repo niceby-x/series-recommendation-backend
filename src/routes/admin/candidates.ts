@@ -2,11 +2,35 @@
 // list/counts, taxonomy edits, approve/reject/restore (admin only).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
 import { logAdminAction } from '../../services/auditLog';
+import { validateBody } from '../../middleware/validate';
 
 const router = Router();
+
+// Allowed values per BLumi Taxonomy v1 (blumi-taxonomy-v1.md), §2.1-2.4.
+// Emotional Intensity and Content Level are legitimately nullable per the
+// spec ("may be blank until Level 2... blank should mean genuinely
+// unreviewed, never a defaulted value") -- Romance Pace and Ending Type
+// are Level 1 "required," but that's a publish-readiness rule, not a
+// constraint on this PATCH endpoint itself (a partial update may
+// legitimately not touch them), so all four stay optional here too.
+const ROMANCE_PACE_VALUES = ['slow_burn', 'natural_progression', 'instant_attraction', 'established_relationship'] as const;
+const EMOTIONAL_INTENSITY_VALUES = ['lighthearted', 'balanced', 'emotionally_heavy'] as const;
+const ENDING_TYPE_VALUES = ['happy', 'bittersweet', 'open', 'tragic'] as const;
+const CONTENT_LEVEL_VALUES = ['sweet', 'mature'] as const;
+
+const candidateTaxonomySchema = z
+    .object({
+        romance_pace: z.enum(ROMANCE_PACE_VALUES).nullable().optional(),
+        emotional_intensity: z.enum(EMOTIONAL_INTENSITY_VALUES).nullable().optional(),
+        ending_type: z.enum(ENDING_TYPE_VALUES).nullable().optional(),
+        content_level: z.enum(CONTENT_LEVEL_VALUES).nullable().optional(),
+        tag_ids: z.array(z.number()).optional(),
+    })
+    .strip();
 
 // Route 9 - List TMDB import candidates by review status (admin only).
 // Defaults to 'pending'; pass ?status=approved or ?status=rejected for the history views.
@@ -101,7 +125,7 @@ router.get('/counts', async (req: Request, res: Response) => {
 // ending_type?, content_level?, tag_ids?: number[] }. tag_ids, if present, is the COMPLETE
 // desired set of tag ids across all 5 Discovery Tag dimensions — this route diffs against
 // what's currently linked rather than requiring the client to compute the diff.
-router.patch('/:id/taxonomy', async (req: Request, res: Response) => {
+router.patch('/:id/taxonomy', validateBody(candidateTaxonomySchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 

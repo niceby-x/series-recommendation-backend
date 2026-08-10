@@ -219,6 +219,52 @@ describe('PATCH /admin/candidates/:id/taxonomy', () => {
         expect(res.status).toBe(403);
     });
 
+    it('rejects a non-string romance_pace with 400', async () => {
+        requireAdminMock.mockImplementation(allowAdmin());
+
+        const res = await request(buildApp())
+            .patch('/admin/candidates/1/taxonomy')
+            .send({ romance_pace: 42 });
+
+        expect(res.status).toBe(400);
+    });
+
+    it('rejects a romance_pace value outside the Taxonomy v1 enum with 400', async () => {
+        requireAdminMock.mockImplementation(allowAdmin());
+
+        const res = await request(buildApp())
+            .patch('/admin/candidates/1/taxonomy')
+            .send({ romance_pace: 'slowburn' }); // real value is 'slow_burn'
+
+        expect(res.status).toBe(400);
+    });
+
+    it('accepts a valid enum value for every taxonomy field, and null to explicitly clear one', async () => {
+        requireAdminMock.mockImplementation(allowAdmin());
+        queue('series_candidates', { data: null, error: null }); // attributeUpdate
+
+        const res = await request(buildApp())
+            .patch('/admin/candidates/1/taxonomy')
+            .send({
+                romance_pace: 'slow_burn',
+                emotional_intensity: null, // legitimately nullable per the spec ("genuinely unreviewed")
+                ending_type: 'bittersweet',
+                content_level: 'mature',
+            });
+
+        expect(res.status).toBe(200);
+    });
+
+    it('rejects a tag_ids array containing a non-number with 400', async () => {
+        requireAdminMock.mockImplementation(allowAdmin());
+
+        const res = await request(buildApp())
+            .patch('/admin/candidates/1/taxonomy')
+            .send({ tag_ids: [1, 'two', 3] });
+
+        expect(res.status).toBe(400);
+    });
+
     it('is a no-op (200) when the body has no attribute fields and no tag_ids', async () => {
         requireAdminMock.mockImplementation(allowAdmin());
 

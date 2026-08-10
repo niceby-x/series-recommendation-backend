@@ -2,10 +2,52 @@
 // tag/genre/curated-collection reassignment (admin only).
 
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
+import { validateBody } from '../../middleware/validate';
 
 const router = Router();
+
+// status is a real, confirmed enum -- src/types.ts's Series interface
+// declares exactly these three values, and the TMDB import script
+// (src/scripts/discover-series-by-keyword.ts's mapStatus()) only ever
+// produces 'airing'/'completed' from that same set, so this is safe to
+// enforce strictly rather than just type-check. Without this, a bad value
+// here previously surfaced as a raw Postgres CHECK-constraint error
+// instead of a clean 400.
+const SERIES_STATUS_VALUES = ['airing', 'completed', 'upcoming'] as const;
+
+// romance_pace/emotional_intensity/ending_type/content_level: allowed
+// values per BLumi Taxonomy v1 (blumi-taxonomy-v1.md), §2.1-2.4 -- same
+// enums as candidates.ts's taxonomy schema. Emotional Intensity and
+// Content Level are legitimately nullable per the spec (blank means
+// "genuinely unreviewed," not a default).
+const ROMANCE_PACE_VALUES = ['slow_burn', 'natural_progression', 'instant_attraction', 'established_relationship'] as const;
+const EMOTIONAL_INTENSITY_VALUES = ['lighthearted', 'balanced', 'emotionally_heavy'] as const;
+const ENDING_TYPE_VALUES = ['happy', 'bittersweet', 'open', 'tragic'] as const;
+const CONTENT_LEVEL_VALUES = ['sweet', 'mature'] as const;
+
+const editSeriesSchema = z
+    .object({
+        title: z.string().trim().min(1).optional(),
+        original_title: z.string().nullable().optional(),
+        synopsis: z.string().nullable().optional(),
+        country: z.string().trim().min(1).optional(),
+        year: z.number().int().optional(),
+        episode_count: z.number().int().nonnegative().optional(),
+        status: z.enum(SERIES_STATUS_VALUES).optional(),
+        poster_url: z.string().nullable().optional(),
+        backdrop_url: z.string().nullable().optional(),
+        romance_pace: z.enum(ROMANCE_PACE_VALUES).nullable().optional(),
+        emotional_intensity: z.enum(EMOTIONAL_INTENSITY_VALUES).nullable().optional(),
+        ending_type: z.enum(ENDING_TYPE_VALUES).nullable().optional(),
+        content_level: z.enum(CONTENT_LEVEL_VALUES).nullable().optional(),
+        tag_ids: z.array(z.number()).optional(),
+        genre_names: z.array(z.string()).optional(),
+        collection_ids: z.array(z.number()).optional(),
+    })
+    .strip();
 
 // Route 18 - Edit a published series (admin only). Unlike candidate
 // approval's `overrides`, this mutates a LIVE row directly -- there was
@@ -14,7 +56,7 @@ const router = Router();
 // what's sent gets updated); genre_names, if present, is the COMPLETE
 // desired genre list and gets diffed against what's currently linked
 // (find-or-create each, same pattern as the approve route), not appended.
-router.patch('/:id', async (req: Request, res: Response) => {
+router.patch('/:id', validateBody(editSeriesSchema), async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
