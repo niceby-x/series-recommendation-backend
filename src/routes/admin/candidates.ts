@@ -4,6 +4,7 @@
 import { Router, Request, Response } from 'express';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
+import { logAdminAction } from '../../services/auditLog';
 
 const router = Router();
 
@@ -345,6 +346,8 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
         return res.status(500).json({ message: updateError.message });
     }
 
+    await logAdminAction(req, 'candidate.approve', 'candidate:' + id);
+
     res.status(200).json({ message: 'Approved and added to catalog' });
 });
 // Route 11 - Reject a candidate (admin only). A1-02: if it was previously
@@ -411,6 +414,8 @@ router.post('/:id/reject', async (req: Request, res: Response) => {
     if (updateError) {
         return res.status(500).json({ message: updateError.message });
     }
+
+    await logAdminAction(req, 'candidate.reject', 'candidate:' + id);
 
     res.status(200).json({ message: 'Rejected' });
 });
@@ -479,6 +484,8 @@ router.post('/:id/restore', async (req: Request, res: Response) => {
     if (updateError) {
         return res.status(500).json({ message: updateError.message });
     }
+
+    await logAdminAction(req, 'candidate.restore', 'candidate:' + id);
 
     res.status(200).json({ message: 'Restored to pending' });
 });

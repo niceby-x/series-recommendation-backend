@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
 import { validateBody } from '../../middleware/validate';
+import { logAdminAction } from '../../services/auditLog';
 
 const router = Router();
 
@@ -146,6 +147,8 @@ router.patch('/:id/admin', validateBody(adminFlagSchema), async (req: Request, r
         return res.status(500).json({ message: error.message });
     }
 
+    await logAdminAction(req, is_admin ? 'user.promote' : 'user.demote', 'user:' + id);
+
     res.json({ message: is_admin ? 'User promoted to admin' : 'Admin access removed', data });
 });
 // Route 13c - Ban/unban a user (admin only). Body: { is_banned: boolean }.
@@ -188,6 +191,8 @@ router.patch('/:id/ban', validateBody(banFlagSchema), async (req: Request, res: 
     if (error) {
         return res.status(500).json({ message: error.message });
     }
+
+    await logAdminAction(req, is_banned ? 'user.ban' : 'user.unban', 'user:' + id);
 
     res.json({ message: is_banned ? 'User banned' : 'User unbanned', data });
 });
@@ -236,6 +241,8 @@ router.delete('/:id', async (req: Request, res: Response) => {
             console.error('Deleted users row for id ' + id + ' but failed to delete its auth account:', authDeleteError.message);
         }
     }
+
+    await logAdminAction(req, 'user.delete', 'user:' + id);
 
     res.status(200).json({ message: 'User deleted' });
 });

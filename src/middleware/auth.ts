@@ -8,6 +8,20 @@
 import { Request, Response } from 'express';
 import { supabase } from '../services/supabase';
 
+// A2-02: augment Express's Request so requireAdmin can attach the caller's
+// identity for routes that need to log who did something (see
+// services/auditLog.ts). Set once, here, rather than each logging call
+// re-hitting supabase.auth.getUser() with the same token requireAdmin
+// already verified.
+declare global {
+    // eslint-disable-next-line @typescript-eslint/no-namespace
+    namespace Express {
+        interface Request {
+            adminActor?: { id: number | null; email: string | null };
+        }
+    }
+}
+
 // Helper - Verify the Supabase Auth token and get-or-create the matching users row.
 // Returns the integer user_id from the `users` table, or null if the token is invalid.
 export async function getOrCreateUserId(authHeader: string | undefined): Promise<number | null> {
@@ -117,6 +131,8 @@ export async function requireAdmin(req: Request, res: Response): Promise<boolean
     if (isBootstrapAdmin && userRow && !userRow.is_admin) {
         await supabase.from('users').update({ is_admin: true }).eq('id', userRow.id);
     }
+
+    req.adminActor = { id: userRow?.id ?? null, email: authUser.email ?? null };
 
     return true;
 }
