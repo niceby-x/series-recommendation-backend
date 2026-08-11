@@ -42,8 +42,9 @@ later files sometimes depend on tables/columns earlier ones create (e.g.
 | 006 | `006_admin_actions_table.sql` | Creates `admin_actions` | Audit logging in `/admin/users` (promote/demote, ban/unban, delete) and `/admin/candidates` (approve/reject/restore) (A2-02) |
 | 007 | `007_series_rank_snapshots.sql` | Creates `series_rank_snapshots` | `POST /admin/rank-snapshots/run`, `GET /series`'s `rank`/`rank_trend` fields (H2-01) |
 | 008 | `008_gamification_tables.sql` | Creates `user_stats`, `user_activity_days`, `user_xp_events` | `POST /ratings`, `POST /watchlist` (fire-and-forget XP/streak recording), `GET /me/gamification` (H2-03) |
+| 009 | `009_episode_progress.sql` | Creates `user_episode_progress` | `PUT /watchlist/:seriesId/progress`, `GET /watchlist`'s `progress` field, `GET /me/activity`'s `progress` entries (H2-02) |
 
-All eight are assumed already applied to production as of this README --
-this table exists so the next migration (`009_...`) has a clear number to
-follow and a place to log itself, not because any of these are still
-pending.
+All nine are assumed already applied to production as of this README's
+last update -- 009 is new, run it before deploying the progress routes or
+`GET /me/activity` will 500 the moment it tries to query a table that
+doesn't exist yet.

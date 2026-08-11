@@ -4,9 +4,9 @@
 // Confirms it 401s when signed out and returns the user's own row
 // (including username, the field the frontend half needs) when signed in.
 //
-// H2-04: covers GET /me/activity -- merging ratings + watchlist rows
-// into one newest-first feed, and that a signed-out request 401s the
-// same way GET /me does.
+// H2-04: covers GET /me/activity -- merging ratings + watchlist +
+// (H2-02) episode-progress rows into one newest-first feed, and that a
+// signed-out request 401s the same way GET /me does.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import express from 'express';
@@ -95,7 +95,7 @@ describe('GET /me/activity (H2-04)', () => {
         expect(res.body.message).toMatch(/must be signed in/i);
     });
 
-    it('merges ratings and watchlist rows, newest first, capped at the limit', async () => {
+    it('merges ratings, watchlist, and progress rows, newest first, capped at the limit', async () => {
         vi.mocked(getOrCreateUserId).mockResolvedValue(42);
         queue('ratings', {
             data: [
@@ -110,14 +110,26 @@ describe('GET /me/activity (H2-04)', () => {
             ],
             error: null,
         });
+        queue('user_episode_progress', {
+            data: [
+                { id: 9, series_id: 40, current_episode: 7, updated_at: '2026-08-11T00:00:00.000Z', series: { title: 'Semantic Error', episode_count: 8 } },
+            ],
+            error: null,
+        });
 
         const res = await request(buildApp()).get('/me/activity');
 
         expect(res.status).toBe(200);
         // Newest first regardless of which table it came from.
-        expect(res.body.data.map((e: any) => e.id)).toEqual(['watchlist:5', 'rating:1', 'watchlist:6']);
-        expect(res.body.data[0]).toMatchObject({ kind: 'watchlist', series_title: 'Step by Step', status: 'completed' });
-        expect(res.body.data[1]).toMatchObject({ kind: 'rating', series_title: 'Cherry Magic', score: 9 });
+        expect(res.body.data.map((e: any) => e.id)).toEqual(['progress:9', 'watchlist:5', 'rating:1', 'watchlist:6']);
+        expect(res.body.data[0]).toMatchObject({
+            kind: 'progress',
+            series_title: 'Semantic Error',
+            current_episode: 7,
+            total_episodes: 8,
+        });
+        expect(res.body.data[1]).toMatchObject({ kind: 'watchlist', series_title: 'Step by Step', status: 'completed' });
+        expect(res.body.data[2]).toMatchObject({ kind: 'rating', series_title: 'Cherry Magic', score: 9 });
     });
 
     it('falls back to "Unknown series" when the series join comes back empty', async () => {
@@ -127,6 +139,7 @@ describe('GET /me/activity (H2-04)', () => {
             error: null,
         });
         queue('user_lists', { data: [], error: null });
+        queue('user_episode_progress', { data: [], error: null });
 
         const res = await request(buildApp()).get('/me/activity');
 
@@ -137,6 +150,7 @@ describe('GET /me/activity (H2-04)', () => {
         vi.mocked(getOrCreateUserId).mockResolvedValue(42);
         queue('ratings', { data: null, error: { message: 'db down' } });
         queue('user_lists', { data: [], error: null });
+        queue('user_episode_progress', { data: [], error: null });
 
         const res = await request(buildApp()).get('/me/activity');
 
@@ -148,6 +162,19 @@ describe('GET /me/activity (H2-04)', () => {
         vi.mocked(getOrCreateUserId).mockResolvedValue(42);
         queue('ratings', { data: [], error: null });
         queue('user_lists', { data: null, error: { message: 'db down' } });
+        queue('user_episode_progress', { data: [], error: null });
+
+        const res = await request(buildApp()).get('/me/activity');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+
+    it('returns 500 if the progress lookup errors', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('ratings', { data: [], error: null });
+        queue('user_lists', { data: [], error: null });
+        queue('user_episode_progress', { data: null, error: { message: 'db down' } });
 
         const res = await request(buildApp()).get('/me/activity');
 

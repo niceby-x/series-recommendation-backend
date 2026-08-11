@@ -47,22 +47,15 @@ router.get('/', async (req: Request, res: Response) => {
 
 // H2-04: Recent Activity on Home was 100% MOCK_RECENT_ACTIVITY -- every
 // signed-in user saw the same fake watchlist/rating/progress events.
-// This merges the user's own real ratings and watchlist changes into one
-// feed, newest first.
-//
-// 'progress' events (the mock's "You finished episode 7 of X") are
-// deliberately NOT included here -- there's no per-episode progress data
-// anywhere in the schema yet (that's H2-02, not started). Returning only
-// the two kinds this app can actually back with real data beats
-// fabricating a fake progress event just to fill out the shape the mock
-// used.
+// This merges the user's own real ratings, watchlist changes, and (since
+// H2-02 shipped) episode progress updates into one feed, newest first.
 //
 // Each source table is queried and limited independently, then merged
 // and re-sorted/re-limited in JS -- there's no single table or view to
-// order across both at the database level without a raw SQL union,
+// order across all three at the database level without a raw SQL union,
 // which the supabase-js client (no direct Postgres connection -- see
 // migrations/README.md) can't express.
-type RecentActivityKind = 'rating' | 'watchlist';
+type RecentActivityKind = 'rating' | 'watchlist' | 'progress';
 
 interface RecentActivityEntry {
     id: string;
@@ -72,6 +65,8 @@ interface RecentActivityEntry {
     occurred_at: string;
     score?: number;
     status?: string;
+    current_episode?: number;
+    total_episodes?: number | null;
 }
 
 const RECENT_ACTIVITY_LIMIT = 10;
@@ -87,7 +82,7 @@ router.get('/activity', async (req: Request, res: Response) => {
         });
     }
 
-    const [ratingsResult, watchlistResult] = await Promise.all([
+    const [ratingsResult, watchlistResult, progressResult] = await Promise.all([
         supabase
             .from('ratings')
             .select('id, series_id, score, created_at, series (title)')
@@ -100,6 +95,12 @@ router.get('/activity', async (req: Request, res: Response) => {
             .eq('user_id', user_id)
             .order('updated_at', { ascending: false })
             .limit(RECENT_ACTIVITY_LIMIT),
+        supabase
+            .from('user_episode_progress')
+            .select('id, series_id, current_episode, updated_at, series (title, episode_count)')
+            .eq('user_id', user_id)
+            .order('updated_at', { ascending: false })
+            .limit(RECENT_ACTIVITY_LIMIT),
     ]);
 
     if (ratingsResult.error) {
@@ -107,6 +108,9 @@ router.get('/activity', async (req: Request, res: Response) => {
     }
     if (watchlistResult.error) {
         return res.status(500).json({ message: watchlistResult.error.message });
+    }
+    if (progressResult.error) {
+        return res.status(500).json({ message: progressResult.error.message });
     }
 
     const ratingEntries: RecentActivityEntry[] = (ratingsResult.data || []).map((row: any) => ({
@@ -134,7 +138,20 @@ router.get('/activity', async (req: Request, res: Response) => {
         status: row.status,
     }));
 
-    const merged = [...ratingEntries, ...watchlistEntries]
+    // H2-02: real per-episode progress now exists, so this is an actual
+    // "you got to episode 7" event, not a fabricated one -- see this
+    // route's header comment for why this couldn't be included before.
+    const progressEntries: RecentActivityEntry[] = (progressResult.data || []).map((row: any) => ({
+        id: 'progress:' + row.id,
+        kind: 'progress',
+        series_id: row.series_id,
+        series_title: row.series?.title ?? 'Unknown series',
+        occurred_at: row.updated_at,
+        current_episode: row.current_episode,
+        total_episodes: row.series?.episode_count ?? null,
+    }));
+
+    const merged = [...ratingEntries, ...watchlistEntries, ...progressEntries]
         .sort((a, b) => new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime())
         .slice(0, RECENT_ACTIVITY_LIMIT);
 
