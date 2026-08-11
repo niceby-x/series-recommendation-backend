@@ -194,6 +194,10 @@ describe('DELETE /admin/users/:id', () => {
         queue('users', { data: { email: 'member@example.com', auth_id: 'auth-5' }, error: null });
         queue('ratings', { data: null, error: null });
         queue('user_lists', { data: null, error: null });
+        // H2-03: gamification tables cleaned up before the user row too.
+        queue('user_xp_events', { data: null, error: null });
+        queue('user_activity_days', { data: null, error: null });
+        queue('user_stats', { data: null, error: null });
         queue('users', { data: null, error: null });
         vi.mocked(supabase.auth.admin.deleteUser).mockResolvedValue({ error: null } as any);
 
@@ -208,6 +212,10 @@ describe('DELETE /admin/users/:id', () => {
         queue('users', { data: { email: 'member@example.com', auth_id: 'auth-5' }, error: null });
         queue('ratings', { data: null, error: null });
         queue('user_lists', { data: null, error: null });
+        // H2-03: gamification tables cleaned up before the user row too.
+        queue('user_xp_events', { data: null, error: null });
+        queue('user_activity_days', { data: null, error: null });
+        queue('user_stats', { data: null, error: null });
         queue('users', { data: null, error: null });
         vi.mocked(supabase.auth.admin.deleteUser).mockResolvedValue({ error: { message: 'auth service down' } } as any);
 

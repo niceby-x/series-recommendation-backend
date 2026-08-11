@@ -41,8 +41,9 @@ later files sometimes depend on tables/columns earlier ones create (e.g.
 | 005 | `005_ratings_unique_constraint.sql` | Adds unique `(user_id, series_id)` on `ratings` | `POST /ratings` upsert (P1-05) |
 | 006 | `006_admin_actions_table.sql` | Creates `admin_actions` | Audit logging in `/admin/users` (promote/demote, ban/unban, delete) and `/admin/candidates` (approve/reject/restore) (A2-02) |
 | 007 | `007_series_rank_snapshots.sql` | Creates `series_rank_snapshots` | `POST /admin/rank-snapshots/run`, `GET /series`'s `rank`/`rank_trend` fields (H2-01) |
+| 008 | `008_gamification_tables.sql` | Creates `user_stats`, `user_activity_days`, `user_xp_events` | `POST /ratings`, `POST /watchlist` (fire-and-forget XP/streak recording), `GET /me/gamification` (H2-03) |
 
-All seven are assumed already applied to production as of this README --
-this table exists so the next migration (`008_...`) has a clear number to
+All eight are assumed already applied to production as of this README --
+this table exists so the next migration (`009_...`) has a clear number to
 follow and a place to log itself, not because any of these are still
 pending.

@@ -15,6 +15,7 @@
 import { Router, Request, Response } from 'express';
 import { supabase } from '../services/supabase';
 import { getOrCreateUserId } from '../middleware/auth';
+import { getGamificationSummary } from '../services/gamification';
 
 const router = Router();
 
@@ -141,6 +142,34 @@ router.get('/activity', async (req: Request, res: Response) => {
         message: 'Your recent activity',
         data: merged,
     });
+});
+
+// H2-03: Bloom Journey (level/XP) and This Week's Journey (discovery
+// streak) were both 100% MOCK_BLOOM_JOURNEY / MOCK_WEEKLY_JOURNEY --
+// every signed-in user saw the identical level, XP, and streak. This one
+// route serves both cards (they're both "this user's current gamification
+// snapshot," no reason to make the frontend fire two fetches for it) --
+// all the actual logic lives in services/gamification.ts and is unit
+// tested there; this route is a thin pass-through, same shape as
+// GET /activity above.
+router.get('/gamification', async (req: Request, res: Response) => {
+    const user_id = await getOrCreateUserId(req.headers.authorization);
+
+    if (!user_id) {
+        return res.status(401).json({
+            message: 'You must be signed in to view your gamification stats'
+        });
+    }
+
+    try {
+        const data = await getGamificationSummary(user_id);
+        res.json({
+            message: 'Your gamification stats',
+            data,
+        });
+    } catch (err) {
+        res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to load gamification stats' });
+    }
 });
 
 export default router;

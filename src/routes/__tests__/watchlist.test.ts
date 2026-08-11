@@ -12,6 +12,12 @@ vi.mock('../../middleware/auth', () => ({
     getOrCreateUserId: vi.fn(),
 }));
 
+// H2-03: same reasoning as ratings.test.ts's own comment -- POST
+// /watchlist fires-and-forgets a gamification call after a successful
+// upsert, mocked here so these tests don't depend on it or hit
+// unmocked supabase calls.
+vi.mock('../../services/gamification', () => ({ recordActivity: vi.fn().mockResolvedValue(undefined) }));
+
 const upsertSelectMock = vi.fn();
 
 vi.mock('../../services/supabase', () => ({

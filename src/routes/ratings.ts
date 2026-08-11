@@ -6,6 +6,7 @@ import { supabase } from '../services/supabase';
 import { Rating, ApiResponse } from '../types';
 import { getOrCreateUserId } from '../middleware/auth';
 import { validateBody } from '../middleware/validate';
+import { recordActivity } from '../services/gamification';
 
 const router = Router();
 
@@ -63,6 +64,14 @@ router.post('/', validateBody(submitRatingSchema), async (req: Request, res: Res
     if (error) {
         return res.status(500).json({ message: error.message});
     }
+
+    // H2-03: fire-and-forget -- a rating that saved successfully should
+    // never come back as a failure to the user just because the
+    // gamification side-effect hiccuped. Logged so it's not silently
+    // lost, but not awaited into the response.
+    recordActivity(user_id, 'rating').catch((err) => {
+        console.error('Failed to record gamification activity for rating:', err instanceof Error ? err.message : err);
+    });
 
     const response: ApiResponse<Rating> = {
         message: 'Rating submitted successfully!',

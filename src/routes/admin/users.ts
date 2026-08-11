@@ -232,6 +232,15 @@ router.delete('/:id', async (req: Request, res: Response) => {
     const { error: listsError } = await supabase.from('user_lists').delete().eq('user_id', id);
     if (listsError) return res.status(500).json({ message: listsError.message });
 
+    // H2-03: same explicit-cleanup-before-delete convention as
+    // ratings/user_lists above -- these three all cascade on user_id too
+    // (see migrations/008_gamification_tables.sql), but this codebase
+    // deletes FK dependents explicitly rather than relying on that.
+    for (const table of ['user_xp_events', 'user_activity_days', 'user_stats']) {
+        const { error: gamificationError } = await supabase.from(table).delete().eq('user_id', id);
+        if (gamificationError) return res.status(500).json({ message: gamificationError.message });
+    }
+
     const { error: userError } = await supabase.from('users').delete().eq('id', id);
     if (userError) return res.status(500).json({ message: userError.message });
 

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { supabase } from '../services/supabase';
 import { getOrCreateUserId } from '../middleware/auth';
 import { validateBody } from '../middleware/validate';
+import { recordActivity } from '../services/gamification';
 
 const router = Router();
 
@@ -44,6 +45,12 @@ router.post('/', validateBody(upsertWatchlistSchema), async (req: Request, res: 
     if (error) {
         return res.status(500).json({ message: error.message });
     }
+
+    // H2-03: same fire-and-forget reasoning as POST /ratings -- see that
+    // route's comment.
+    recordActivity(user_id, 'watchlist').catch((err) => {
+        console.error('Failed to record gamification activity for watchlist update:', err instanceof Error ? err.message : err);
+    });
 
     res.status(200).json({
         message: 'Watchlist updated',

@@ -17,10 +17,17 @@ vi.mock('../../middleware/auth', () => ({
     getOrCreateUserId: vi.fn(),
 }));
 
+// H2-03: GET /me/gamification delegates entirely to
+// getGamificationSummary (unit tested in services/__tests__/gamification.
+// test.ts) -- mocked here so this file only asserts the route's own
+// auth-gate/pass-through/error-mapping behavior.
+vi.mock('../../services/gamification', () => ({ getGamificationSummary: vi.fn() }));
+
 const { supabase, queue } = mockSupabase();
 vi.mock('../../services/supabase', () => ({ get supabase() { return supabase; } }));
 
 import { getOrCreateUserId } from '../../middleware/auth';
+import { getGamificationSummary } from '../../services/gamification';
 import meRouter from '../me';
 
 function buildApp() {
@@ -143,6 +150,53 @@ describe('GET /me/activity (H2-04)', () => {
         queue('user_lists', { data: null, error: { message: 'db down' } });
 
         const res = await request(buildApp()).get('/me/activity');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+});
+
+describe('GET /me/gamification (H2-03)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('rejects a signed-out request with 401', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+
+        const res = await request(buildApp()).get('/me/gamification');
+
+        expect(res.status).toBe(401);
+        expect(res.body.message).toMatch(/must be signed in/i);
+    });
+
+    it('returns the getGamificationSummary result for a signed-in user', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        vi.mocked(getGamificationSummary).mockResolvedValue({
+            level: 12,
+            label: 'Devoted Reader',
+            xp: 620,
+            xp_to_next: 900,
+            total_xp: 4620,
+            current_streak_days: 5,
+            longest_streak_days: 9,
+            week: [],
+            week_completed_count: 5,
+            week_goal: 7,
+        } as any);
+
+        const res = await request(buildApp()).get('/me/gamification');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toMatchObject({ level: 12, xp: 620, week_completed_count: 5 });
+        expect(getGamificationSummary).toHaveBeenCalledWith(42);
+    });
+
+    it('returns 500 if the summary lookup throws', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        vi.mocked(getGamificationSummary).mockRejectedValue(new Error('db down'));
+
+        const res = await request(buildApp()).get('/me/gamification');
 
         expect(res.status).toBe(500);
         expect(res.body.message).toBe('db down');

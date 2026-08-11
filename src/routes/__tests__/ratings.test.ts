@@ -19,6 +19,13 @@ vi.mock('../../middleware/auth', () => ({
     getOrCreateUserId: vi.fn(),
 }));
 
+// H2-03: POST /ratings fires-and-forgets a gamification recordActivity()
+// call after a successful upsert. Mocked here the same way H2-01/H2-04
+// mock their own side-effect services, so these tests aren't asserting
+// anything about gamification (that's rankSnapshots.test.ts's own file's
+// job) and don't hit real supabase calls that aren't otherwise mocked.
+vi.mock('../../services/gamification', () => ({ recordActivity: vi.fn().mockResolvedValue(undefined) }));
+
 const upsertSelectMock = vi.fn();
 const maybeSingleMock = vi.fn();
 
