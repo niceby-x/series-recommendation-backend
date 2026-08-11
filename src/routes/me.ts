@@ -16,6 +16,7 @@ import { Router, Request, Response } from 'express';
 import { supabase } from '../services/supabase';
 import { getOrCreateUserId } from '../middleware/auth';
 import { getGamificationSummary } from '../services/gamification';
+import { getRecommendationsForUser } from '../services/recommendations';
 
 const router = Router();
 
@@ -186,6 +187,37 @@ router.get('/gamification', async (req: Request, res: Response) => {
         });
     } catch (err) {
         res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to load gamification stats' });
+    }
+});
+
+// H3-01: "Made For You" -- all the real matching logic lives in
+// services/recommendations.ts (unit tested there); this route is the
+// same thin auth-gate-then-pass-through shape as GET /gamification
+// above. has_enough_signal tells the frontend whether to render the
+// section at all vs. a "rate a few shows" prompt -- see the service's
+// header comment for why an empty list here is the honest answer for a
+// brand new user, not a fallback to generic popular titles.
+router.get('/recommendations', async (req: Request, res: Response) => {
+    const user_id = await getOrCreateUserId(req.headers.authorization);
+
+    if (!user_id) {
+        return res.status(401).json({
+            message: 'You must be signed in to view your recommendations'
+        });
+    }
+
+    const limit = Math.max(1, Math.min(50, parseInt(req.query.limit as string) || 10));
+
+    try {
+        const { has_enough_signal, data } = await getRecommendationsForUser(user_id, limit);
+        res.json({
+            message: has_enough_signal ? 'Made for you' : 'Not enough signal yet',
+            has_enough_signal,
+            count: data.length,
+            data,
+        });
+    } catch (err) {
+        res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to load recommendations' });
     }
 });
 

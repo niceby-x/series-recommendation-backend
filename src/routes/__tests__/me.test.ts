@@ -23,11 +23,16 @@ vi.mock('../../middleware/auth', () => ({
 // auth-gate/pass-through/error-mapping behavior.
 vi.mock('../../services/gamification', () => ({ getGamificationSummary: vi.fn() }));
 
+// H3-01: same reasoning as gamification above -- getRecommendationsForUser
+// is unit tested in services/__tests__/recommendations.test.ts.
+vi.mock('../../services/recommendations', () => ({ getRecommendationsForUser: vi.fn() }));
+
 const { supabase, queue } = mockSupabase();
 vi.mock('../../services/supabase', () => ({ get supabase() { return supabase; } }));
 
 import { getOrCreateUserId } from '../../middleware/auth';
 import { getGamificationSummary } from '../../services/gamification';
+import { getRecommendationsForUser } from '../../services/recommendations';
 import meRouter from '../me';
 
 function buildApp() {
@@ -224,6 +229,59 @@ describe('GET /me/gamification (H2-03)', () => {
         vi.mocked(getGamificationSummary).mockRejectedValue(new Error('db down'));
 
         const res = await request(buildApp()).get('/me/gamification');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+});
+
+describe('GET /me/recommendations (H3-01)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('rejects a signed-out request with 401', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+
+        const res = await request(buildApp()).get('/me/recommendations');
+
+        expect(res.status).toBe(401);
+        expect(res.body.message).toMatch(/must be signed in/i);
+    });
+
+    it('passes through has_enough_signal: false for a cold-start user', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        vi.mocked(getRecommendationsForUser).mockResolvedValue({ has_enough_signal: false, data: [] });
+
+        const res = await request(buildApp()).get('/me/recommendations');
+
+        expect(res.status).toBe(200);
+        expect(res.body.has_enough_signal).toBe(false);
+        expect(res.body.data).toEqual([]);
+    });
+
+    it('returns scored recommendations for a user with signal', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        vi.mocked(getRecommendationsForUser).mockResolvedValue({
+            has_enough_signal: true,
+            data: [
+                { id: 3, title: 'Strong Match', poster_url: null, year: 2025, country: 'TH', score: 14, match_reasons: ['Enemies to Lovers'] },
+            ],
+        });
+
+        const res = await request(buildApp()).get('/me/recommendations?limit=5');
+
+        expect(res.status).toBe(200);
+        expect(res.body.has_enough_signal).toBe(true);
+        expect(res.body.data[0]).toMatchObject({ id: 3, title: 'Strong Match' });
+        expect(getRecommendationsForUser).toHaveBeenCalledWith(42, 5);
+    });
+
+    it('returns 500 if the recommendation lookup throws', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        vi.mocked(getRecommendationsForUser).mockRejectedValue(new Error('db down'));
+
+        const res = await request(buildApp()).get('/me/recommendations');
 
         expect(res.status).toBe(500);
         expect(res.body.message).toBe('db down');
