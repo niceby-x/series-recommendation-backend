@@ -35,6 +35,14 @@ vi.mock('../../services/supabase', () => ({
 const { getRankTrendsMock } = vi.hoisted(() => ({ getRankTrendsMock: vi.fn() }));
 vi.mock('../../services/rankSnapshots', () => ({ getRankTrends: getRankTrendsMock }));
 
+// Q2-02: GET /:id/related is a thin pass-through to this service (same
+// shape as GET /me/recommendations' own route) -- mocked here so these
+// tests cover the route's auth/error/response-shape behavior without
+// re-deriving the scoring logic, which is already covered directly in
+// services/__tests__/recommendations.test.ts.
+const { getRelatedSeriesMock } = vi.hoisted(() => ({ getRelatedSeriesMock: vi.fn() }));
+vi.mock('../../services/recommendations', () => ({ getRelatedSeries: getRelatedSeriesMock }));
+
 import seriesRouter from '../series';
 
 function buildApp() {
@@ -175,5 +183,49 @@ describe('GET /series', () => {
         const res = await request(buildApp()).get('/series');
 
         expect(res.body.pagination).toBeUndefined();
+    });
+});
+
+describe('GET /series/:id/related (Q2-02)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        getRankTrendsMock.mockResolvedValue(new Map());
+    });
+
+    it('passes the parsed id and limit through to getRelatedSeries', async () => {
+        getRelatedSeriesMock.mockResolvedValue([]);
+
+        await request(buildApp()).get('/series/7/related?limit=5');
+
+        expect(getRelatedSeriesMock).toHaveBeenCalledWith(7, 5);
+    });
+
+    it('defaults to a limit of 10 when none is given', async () => {
+        getRelatedSeriesMock.mockResolvedValue([]);
+
+        await request(buildApp()).get('/series/7/related');
+
+        expect(getRelatedSeriesMock).toHaveBeenCalledWith(7, 10);
+    });
+
+    it('returns the related series with a count', async () => {
+        getRelatedSeriesMock.mockResolvedValue([
+            { id: 2, title: 'Related Show', poster_url: null, year: 2024, country: 'TH', score: 3, match_reasons: ['Slow Burn'] },
+        ]);
+
+        const res = await request(buildApp()).get('/series/7/related');
+
+        expect(res.status).toBe(200);
+        expect(res.body.count).toBe(1);
+        expect(res.body.data[0]).toMatchObject({ id: 2, title: 'Related Show' });
+    });
+
+    it('returns 500 if the service throws', async () => {
+        getRelatedSeriesMock.mockRejectedValue(new Error('db down'));
+
+        const res = await request(buildApp()).get('/series/7/related');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
     });
 });

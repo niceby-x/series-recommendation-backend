@@ -15,7 +15,7 @@ const { supabase, queue } = mockSupabase();
 import { vi } from 'vitest';
 vi.mock('../supabase', () => ({ get supabase() { return supabase; } }));
 
-import { getRecommendationsForUser } from '../recommendations';
+import { getRecommendationsForUser, getRelatedSeries } from '../recommendations';
 
 beforeEach(() => {
     vi.clearAllMocks();
@@ -139,5 +139,106 @@ describe('getRecommendationsForUser', () => {
         queue('user_lists', { data: [], error: null });
 
         await expect(getRecommendationsForUser(42)).rejects.toThrow('db down');
+    });
+});
+
+describe('getRelatedSeries', () => {
+    it('returns an empty list for a series with no tags or genres', async () => {
+        // Seed pass: series 1 has neither tags nor genres.
+        queue('series_tags', { data: [], error: null });
+        queue('series_genres', { data: [], error: null });
+
+        const result = await getRelatedSeries(1);
+
+        expect(result).toEqual([]);
+    });
+
+    it('scores other series by overlap with the seed series\' own tags/genres', async () => {
+        // Seed pass: series 1's own tags/genres.
+        queue('series_tags', {
+            data: [
+                { series_id: 1, tags: { id: 100, dimension: 'trope', display_label: 'Enemies to Lovers' } },
+                { series_id: 1, tags: { id: 101, dimension: 'content_warning', display_label: 'Graphic Violence' } }, // must NOT influence scoring
+            ],
+            error: null,
+        });
+        queue('series_genres', {
+            data: [{ series_id: 1, genres: { name: 'Romance' } }],
+            error: null,
+        });
+
+        // Full series table (for candidate pool) -- series 1 itself must
+        // be excluded even though it's in this result set.
+        queue('series', {
+            data: [
+                { id: 1, title: 'Seed Show', poster_url: null, year: 2024, country: 'TH' },
+                { id: 2, title: 'Strong Match', poster_url: null, year: 2025, country: 'TH' },
+                { id: 3, title: 'No Overlap', poster_url: null, year: 2022, country: 'JP' },
+            ],
+            error: null,
+        });
+
+        // Candidate pass: tags/genres for series [2, 3].
+        queue('series_tags', {
+            data: [{ series_id: 2, tags: { id: 100, dimension: 'trope', display_label: 'Enemies to Lovers' } }],
+            error: null,
+        });
+        queue('series_genres', {
+            data: [{ series_id: 2, genres: { name: 'Romance' } }],
+            error: null,
+        });
+
+        const result = await getRelatedSeries(1);
+
+        // The seed series itself must never appear in its own related list.
+        expect(result.map((r) => r.id)).not.toContain(1);
+        // Zero-overlap candidate excluded entirely.
+        expect(result.map((r) => r.id)).not.toContain(3);
+
+        const strongMatch = result.find((r) => r.id === 2);
+        expect(strongMatch).toBeDefined();
+        expect(strongMatch!.score).toBeGreaterThan(0);
+        expect(strongMatch!.match_reasons).toContain('Enemies to Lovers');
+        // content_warning tags never appear as a match reason.
+        expect(strongMatch!.match_reasons).not.toContain('Graphic Violence');
+    });
+
+    it('respects the limit parameter', async () => {
+        queue('series_tags', {
+            data: [{ series_id: 1, tags: { id: 100, dimension: 'trope', display_label: 'Slow Burn' } }],
+            error: null,
+        });
+        queue('series_genres', { data: [], error: null });
+        queue('series', {
+            data: [
+                { id: 1, title: 'Seed', poster_url: null, year: 2024, country: 'TH' },
+                { id: 2, title: 'Match A', poster_url: null, year: 2024, country: 'TH' },
+                { id: 3, title: 'Match B', poster_url: null, year: 2024, country: 'TH' },
+            ],
+            error: null,
+        });
+        queue('series_tags', {
+            data: [
+                { series_id: 2, tags: { id: 100, dimension: 'trope', display_label: 'Slow Burn' } },
+                { series_id: 3, tags: { id: 100, dimension: 'trope', display_label: 'Slow Burn' } },
+            ],
+            error: null,
+        });
+        queue('series_genres', { data: [], error: null });
+
+        const result = await getRelatedSeries(1, 1);
+
+        expect(result).toHaveLength(1);
+    });
+
+    it('throws if the series lookup errors', async () => {
+        queue('series_tags', {
+            data: [{ series_id: 1, tags: { id: 100, dimension: 'trope', display_label: 'Slow Burn' } }],
+            error: null,
+        });
+        queue('series_genres', { data: [], error: null });
+        queue('series', { data: null, error: { message: 'db down' } });
+
+        await expect(getRelatedSeries(1)).rejects.toThrow('db down');
     });
 });

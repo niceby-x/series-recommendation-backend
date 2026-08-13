@@ -4,6 +4,7 @@ import { Router, Request, Response } from 'express';
 import { supabase } from '../services/supabase';
 import { Series, ApiResponse } from '../types';
 import { getRankTrends } from '../services/rankSnapshots';
+import { getRelatedSeries } from '../services/recommendations';
 
 const router = Router();
 
@@ -173,6 +174,27 @@ router.get('/:id', async (req: Request, res: Response) => {
         message: "Success",
         data: { ...rest, genre_names, tags, tag_ids, collection_ids, average_rating, rating_count }
     });
+});
+
+// Route 4 - Get series related to one series (Q2-02), for the "more like
+// this" section on the detail page. Public, no auth -- reuses the same
+// tag/genre overlap scoring as GET /me/recommendations (see
+// services/recommendations.ts's getRelatedSeries), just seeded from this
+// series' own tags/genres instead of a signed-in user's taste history.
+router.get('/:id/related', async (req: Request, res: Response) => {
+    const id = parseInt(req.params.id as string);
+    const limit = Math.max(1, Math.min(50, parseInt(req.query.limit as string) || 10));
+
+    try {
+        const data = await getRelatedSeries(id, limit);
+        res.json({
+            message: 'Related series',
+            count: data.length,
+            data,
+        });
+    } catch (err) {
+        res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to load related series' });
+    }
 });
 
 export default router;

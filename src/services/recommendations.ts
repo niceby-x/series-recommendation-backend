@@ -108,6 +108,70 @@ async function fetchTagsAndGenresBySeries(seriesIds: number[]) {
     return { tagsBySeriesId, genresBySeriesId };
 }
 
+interface CandidateSeries {
+    id: number;
+    title: string;
+    poster_url: string | null;
+    year: number;
+    country: string;
+}
+
+// Scores a candidate pool against an already-built tag/genre profile --
+// shared by getRecommendationsForUser (profile built from a user's
+// ratings/watchlist) and getRelatedSeries (profile built from one
+// series' own tags/genres, Q2-02) so the actual overlap-scoring math
+// only lives in one place.
+function scoreCandidatesAgainstProfile(
+    candidates: CandidateSeries[],
+    candidateTagsBySeriesId: Map<number, SeriesTagRow[]>,
+    candidateGenresBySeriesId: Map<number, string[]>,
+    tagProfile: Map<number, ProfileEntry>,
+    genreProfile: Map<string, number>,
+    limit: number
+): Recommendation[] {
+    const scored: Recommendation[] = candidates.map((series) => {
+        let score = 0;
+        const matchedTags: { label: string; weight: number }[] = [];
+
+        for (const tag of candidateTagsBySeriesId.get(series.id) || []) {
+            const profileEntry = tagProfile.get(tag.id);
+            if (profileEntry) {
+                score += profileEntry.weight;
+                matchedTags.push({ label: profileEntry.display_label, weight: profileEntry.weight });
+            }
+        }
+
+        for (const genreName of candidateGenresBySeriesId.get(series.id) || []) {
+            const genreWeight = genreProfile.get(genreName);
+            if (genreWeight) {
+                score += genreWeight * GENRE_MATCH_WEIGHT;
+            }
+        }
+
+        // Strongest-matching tags first, deduped, so a series matched on
+        // someone's single strongest taste signal doesn't get buried
+        // behind weaker ones in the displayed reason.
+        const rankedReasons = [...new Map(matchedTags.map((t) => [t.label, t.weight])).entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([label]) => label);
+
+        return {
+            id: series.id,
+            title: series.title,
+            poster_url: series.poster_url,
+            year: series.year,
+            country: series.country,
+            score: Math.round(score * 100) / 100,
+            match_reasons: rankedReasons.slice(0, MAX_REASON_TAGS),
+        };
+    });
+
+    return scored
+        .filter((s) => s.score >= MIN_SCORE_TO_RECOMMEND)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+}
+
 export async function getRecommendationsForUser(user_id: number, limit = 10): Promise<RecommendationsResult> {
     const [ratingsResult, watchlistResult] = await Promise.all([
         supabase.from('ratings').select('series_id, score').eq('user_id', user_id),
@@ -185,47 +249,62 @@ export async function getRecommendationsForUser(user_id: number, limit = 10): Pr
     const { tagsBySeriesId: candidateTagsBySeriesId, genresBySeriesId: candidateGenresBySeriesId } =
         await fetchTagsAndGenresBySeries(candidates.map((c) => c.id));
 
-    const scored: Recommendation[] = candidates.map((series) => {
-        let score = 0;
-        const matchedTags: { label: string; weight: number }[] = [];
-
-        for (const tag of candidateTagsBySeriesId.get(series.id) || []) {
-            const profileEntry = tagProfile.get(tag.id);
-            if (profileEntry) {
-                score += profileEntry.weight;
-                matchedTags.push({ label: profileEntry.display_label, weight: profileEntry.weight });
-            }
-        }
-
-        for (const genreName of candidateGenresBySeriesId.get(series.id) || []) {
-            const genreWeight = genreProfile.get(genreName);
-            if (genreWeight) {
-                score += genreWeight * GENRE_MATCH_WEIGHT;
-            }
-        }
-
-        // Strongest-matching tags first, deduped, so a series matched on
-        // someone's single strongest taste signal doesn't get buried
-        // behind weaker ones in the displayed reason.
-        const rankedReasons = [...new Map(matchedTags.map((t) => [t.label, t.weight])).entries()]
-            .sort((a, b) => b[1] - a[1])
-            .map(([label]) => label);
-
-        return {
-            id: series.id,
-            title: series.title,
-            poster_url: series.poster_url,
-            year: series.year,
-            country: series.country,
-            score: Math.round(score * 100) / 100,
-            match_reasons: rankedReasons.slice(0, MAX_REASON_TAGS),
-        };
-    });
-
-    const data = scored
-        .filter((s) => s.score >= MIN_SCORE_TO_RECOMMEND)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit);
+    const data = scoreCandidatesAgainstProfile(
+        candidates,
+        candidateTagsBySeriesId,
+        candidateGenresBySeriesId,
+        tagProfile,
+        genreProfile,
+        limit
+    );
 
     return { has_enough_signal: true, data };
+}
+
+// Q2-02: "related/recommended content" for the series detail page --
+// same overlap-scoring approach as getRecommendationsForUser above, but
+// the "profile" here is built from the ONE series being viewed (its own
+// tags/genres, each weighted equally) rather than a user's taste
+// history. No auth required -- this is public detail-page data, not a
+// personalized "made for you" feed. Returns an empty list (not an
+// error) for a series with no tags/genres to match on, same "honest
+// empty state" reasoning the user-facing recommendations service uses.
+export async function getRelatedSeries(seriesId: number, limit = 10): Promise<Recommendation[]> {
+    const { tagsBySeriesId: seedTagsBySeriesId, genresBySeriesId: seedGenresBySeriesId } =
+        await fetchTagsAndGenresBySeries([seriesId]);
+
+    const tagProfile = new Map<number, ProfileEntry>();
+    const genreProfile = new Map<string, number>();
+
+    for (const tag of seedTagsBySeriesId.get(seriesId) || []) {
+        if (!PREFERENCE_TAG_DIMENSIONS.has(tag.dimension)) continue;
+        tagProfile.set(tag.id, { weight: 1, display_label: tag.display_label });
+    }
+    for (const genreName of seedGenresBySeriesId.get(seriesId) || []) {
+        genreProfile.set(genreName, 1);
+    }
+
+    if (tagProfile.size === 0 && genreProfile.size === 0) {
+        return [];
+    }
+
+    const { data: allSeries, error: allSeriesError } = await supabase
+        .from('series')
+        .select('id, title, poster_url, year, country');
+
+    if (allSeriesError) throw new Error(allSeriesError.message);
+
+    const candidates = (allSeries || []).filter((s) => s.id !== seriesId);
+
+    const { tagsBySeriesId: candidateTagsBySeriesId, genresBySeriesId: candidateGenresBySeriesId } =
+        await fetchTagsAndGenresBySeries(candidates.map((c) => c.id));
+
+    return scoreCandidatesAgainstProfile(
+        candidates,
+        candidateTagsBySeriesId,
+        candidateGenresBySeriesId,
+        tagProfile,
+        genreProfile,
+        limit
+    );
 }
