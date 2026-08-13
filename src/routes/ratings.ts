@@ -35,8 +35,8 @@ const submitRatingSchema = z
     .superRefine((val, ctx) => {
         if (!val.series_id || !val.score) {
             ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'series_id and score are required' });
-        } else if (val.score < 1 || val.score > 10) {
-            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Score must be between 1 and 10' });
+        } else if (!Number.isInteger(val.score) || val.score < 1 || val.score > 10) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Score must be an integer between 1 and 10' });
         }
     });
 

@@ -93,6 +93,19 @@ describe('POST /ratings', () => {
         expect(res.body.message).toMatch(/between 1 and 10/i);
     });
 
+    // Q1-04: only reachable by a client bypassing the UI's ten discrete
+    // rating buttons -- a real defense-in-depth gap, not a user-facing bug.
+    it('rejects a non-integer score with 400', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+
+        const res = await request(buildApp())
+            .post('/ratings')
+            .send({ series_id: 1, score: 7.5 });
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toMatch(/integer/i);
+    });
+
     it('rejects review_text over 2000 characters with 400 (P2-08)', async () => {
         vi.mocked(getOrCreateUserId).mockResolvedValue(42);
 
