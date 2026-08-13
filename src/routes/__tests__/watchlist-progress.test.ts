@@ -92,6 +92,46 @@ describe('PUT /watchlist/:seriesId/progress', () => {
     });
 });
 
+describe('GET /watchlist/:seriesId/progress (Q2-03)', () => {
+    it('rejects a signed-out request with 401', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+
+        const res = await request(buildApp()).get('/watchlist/10/progress');
+
+        expect(res.status).toBe(401);
+    });
+
+    it('returns the progress row for this series when one exists', async () => {
+        queue('user_episode_progress', {
+            data: { current_episode: 7, minutes_remaining: 18, updated_at: '2026-08-11T00:00:00.000Z' },
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/watchlist/10/progress');
+
+        expect(res.status).toBe(200);
+        expect(res.body.progress).toMatchObject({ current_episode: 7, minutes_remaining: 18 });
+    });
+
+    it('returns progress: null when this series has no progress row', async () => {
+        queue('user_episode_progress', { data: null, error: null });
+
+        const res = await request(buildApp()).get('/watchlist/10/progress');
+
+        expect(res.status).toBe(200);
+        expect(res.body.progress).toBeNull();
+    });
+
+    it('returns 500 if the lookup errors', async () => {
+        queue('user_episode_progress', { data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp()).get('/watchlist/10/progress');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+});
+
 describe('GET /watchlist (progress embed, H2-02)', () => {
     it('rejects a signed-out request with 401', async () => {
         vi.mocked(getOrCreateUserId).mockResolvedValue(null);

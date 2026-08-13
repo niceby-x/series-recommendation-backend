@@ -198,6 +198,46 @@ router.put('/:seriesId/progress', validateBody(updateProgressSchema), async (req
         data: data[0]
     });
 });
+// Route 7.6 - Get the logged-in user's episode progress for one specific
+// series (Q2-03). Previously the only way to read progress was the full
+// GET / list (Route 6), which ProgressTracker.tsx used just to find the
+// one row matching the current series -- an O(n) fetch against the whole
+// watchlist to check a single series. This mirrors GET /:seriesId's
+// shape (Route 7: signed-in-required, null when there's no row) but for
+// user_episode_progress instead of user_lists.
+router.get('/:seriesId/progress', async (req: Request, res: Response) => {
+    const user_id = await getOrCreateUserId(req.headers.authorization);
+
+    if (!user_id) {
+        return res.status(401).json({
+            message: 'You must be signed in to view your watch progress'
+        });
+    }
+
+    const seriesId = parseInt(req.params.seriesId as string);
+
+    const { data, error } = await supabase
+        .from('user_episode_progress')
+        .select('current_episode, minutes_remaining, updated_at')
+        .eq('user_id', user_id)
+        .eq('series_id', seriesId)
+        .maybeSingle();
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.json({
+        message: 'Watch progress',
+        progress: data
+            ? {
+                current_episode: data.current_episode,
+                minutes_remaining: data.minutes_remaining,
+                updated_at: data.updated_at,
+            }
+            : null,
+    });
+});
 // Route 8 - Remove a series from the watchlist entirely
 router.delete('/:seriesId', async (req: Request, res: Response) => {
     const user_id = await getOrCreateUserId(req.headers.authorization);
