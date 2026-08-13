@@ -106,6 +106,23 @@ app.use('/admin/curator-picks', adminCuratorPicksRouter);
 app.use('/admin/collections', adminCollectionsRouter);
 app.use('/admin/rank-snapshots', adminRankSnapshotsRouter);
 
+// Q3-01: catch-all JSON error handler. Every route above handles its own
+// expected errors explicitly (Supabase error objects -> res.status(500).json(...)),
+// but a genuinely unexpected exception (a thrown error, a rejected promise
+// passed to next()) would otherwise fall through to Express's default
+// handler, which isn't guaranteed to return JSON -- breaking every
+// frontend caller that does res.json() on the response. Must be
+// registered last, after all routers, and keep all four parameters so
+// Express recognizes it as an error handler.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+    console.error('Unhandled error:', err.message);
+    if (res.headersSent) {
+        return;
+    }
+    res.status(500).json({ message: 'Something went wrong. Please try again later.' });
+});
+
 app.listen(PORT, () => {
     console.log(`BL Series API is running at http://localhost:${PORT}`);
     reconcileOrphanedImportRun();
