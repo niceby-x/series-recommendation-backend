@@ -53,6 +53,25 @@ router.post('/', validateBody(submitRatingSchema), async (req: Request, res: Res
         });
     }
 
+    // Q3-03: recordActivity() should only fire for a user's first rating
+    // of this series, not for score/review edits on an existing one --
+    // otherwise updating a score from 7 to 9 pays out (or attempts to pay
+    // out) gamification credit indistinguishable from a first-time
+    // rating. The upsert below can't tell us after the fact whether it
+    // inserted or updated, so check beforehand.
+    const { data: existingRating, error: existingRatingError } = await supabase
+        .from('ratings')
+        .select('id')
+        .eq('user_id', user_id)
+        .eq('series_id', series_id)
+        .maybeSingle();
+
+    if (existingRatingError) {
+        return res.status(500).json({ message: existingRatingError.message });
+    }
+
+    const isFirstTimeRating = !existingRating;
+
     const { data, error } = await supabase
         .from('ratings')
         .upsert(
@@ -69,9 +88,11 @@ router.post('/', validateBody(submitRatingSchema), async (req: Request, res: Res
     // never come back as a failure to the user just because the
     // gamification side-effect hiccuped. Logged so it's not silently
     // lost, but not awaited into the response.
-    recordActivity(user_id, 'rating').catch((err) => {
-        console.error('Failed to record gamification activity for rating:', err instanceof Error ? err.message : err);
-    });
+    if (isFirstTimeRating) {
+        recordActivity(user_id, 'rating').catch((err) => {
+            console.error('Failed to record gamification activity for rating:', err instanceof Error ? err.message : err);
+        });
+    }
 
     const response: ApiResponse<Rating> = {
         message: 'Rating submitted successfully!',

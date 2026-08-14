@@ -47,6 +47,7 @@ vi.mock('../../services/supabase', () => ({
 }));
 
 import { getOrCreateUserId } from '../../middleware/auth';
+import { recordActivity } from '../../services/gamification';
 import ratingsRouter from '../ratings';
 
 function buildApp() {
@@ -59,6 +60,12 @@ function buildApp() {
 describe('POST /ratings', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        // Q3-03: the route now checks for an existing rating before
+        // upserting, to decide whether to fire recordActivity(). Default
+        // to "no existing rating" (first-time submission) so the
+        // pre-existing tests below -- written before this check existed
+        // -- don't all have to opt into it individually.
+        maybeSingleMock.mockResolvedValue({ data: null, error: null });
     });
 
     it('rejects unauthenticated requests with 401', async () => {
@@ -144,6 +151,38 @@ describe('POST /ratings', () => {
 
         expect(res.status).toBe(201);
         expect(res.body.data).toMatchObject({ series_id: 1, score: 9 });
+        expect(recordActivity).toHaveBeenCalledWith(42, 'rating');
+    });
+
+    // Q3-03: updating an existing rating (a fresh score for a series
+    // this user already rated) should not pay out gamification credit a
+    // second time -- only a genuinely first-time rating should.
+    it('does not call recordActivity when updating an existing rating', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        maybeSingleMock.mockResolvedValue({ data: { id: 1 }, error: null });
+        upsertSelectMock.mockResolvedValue({
+            data: [{ id: 1, user_id: 42, series_id: 1, score: 6, review_text: 'Changed my mind' }],
+            error: null,
+        });
+
+        const res = await request(buildApp())
+            .post('/ratings')
+            .send({ series_id: 1, score: 6, review_text: 'Changed my mind' });
+
+        expect(res.status).toBe(201);
+        expect(recordActivity).not.toHaveBeenCalled();
+    });
+
+    it('returns 500 when the existing-rating lookup fails', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        maybeSingleMock.mockResolvedValue({ data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp())
+            .post('/ratings')
+            .send({ series_id: 1, score: 8 });
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
     });
 });
 
