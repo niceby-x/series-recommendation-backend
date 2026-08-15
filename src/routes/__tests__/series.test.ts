@@ -282,6 +282,107 @@ describe('GET /series', () => {
         expect(res.body.data.map((s: any) => s.id)).toEqual([1]);
     });
 
+    // G1-01: release_date is a real column, so min/max are pushed
+    // straight into the Supabase query, same as year_min/year_max.
+    it('pushes release_date_min/release_date_max into the Supabase query builder', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series?release_date_min=2026-01-01&release_date_max=2026-02-01');
+
+        expect(chain.gte).toHaveBeenCalledWith('release_date', '2026-01-01');
+        expect(chain.lte).toHaveBeenCalledWith('release_date', '2026-02-01');
+    });
+
+    it('pushes sort=newest_release into the Supabase query as release_date desc, id asc', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series?sort=newest_release');
+
+        expect(chain.order).toHaveBeenCalledWith('release_date', { ascending: false });
+        expect(chain.order).toHaveBeenCalledWith('id', { ascending: true });
+    });
+
+    it('does not change sort=newest (year-based) behavior now that newest_release exists', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series?sort=newest');
+
+        expect(chain.order).toHaveBeenCalledWith('year', { ascending: false });
+        expect(chain.order).not.toHaveBeenCalledWith('release_date', { ascending: false });
+    });
+
+    // G1-01: tag_dimension+tag_key depend on the flattened `tags` array,
+    // so -- like genre -- this is a JS-side filter, matching value_key or
+    // display_label after normalization (same rules as the frontend's old
+    // lib/moodMatch.ts).
+    it('filters by tag_dimension+tag_key against the flattened tags, in JS', async () => {
+        mockSelectResult({
+            data: [
+                {
+                    id: 1,
+                    title: 'Romantic Pick',
+                    series_tags: [
+                        { tags: { id: 10, dimension: 'mood', value_key: 'romantic', display_label: 'Romantic', display_emoji: '💕' } },
+                    ],
+                    series_genres: [],
+                    ratings: [],
+                    collection_series: [],
+                },
+                {
+                    id: 2,
+                    title: 'Sad Pick',
+                    series_tags: [
+                        { tags: { id: 11, dimension: 'mood', value_key: 'sad', display_label: 'Sad', display_emoji: '😢' } },
+                    ],
+                    series_genres: [],
+                    ratings: [],
+                    collection_series: [],
+                },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?tag_dimension=mood&tag_key=romantic');
+
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.data[0].id).toBe(1);
+    });
+
+    it('matches tag_key against a normalized value_key or display_label, ignoring case/punctuation', async () => {
+        mockSelectResult({
+            data: [
+                {
+                    id: 1,
+                    title: 'Enemies Pick',
+                    series_tags: [
+                        { tags: { id: 20, dimension: 'trope', value_key: 'enemies_to_lovers', display_label: 'Enemies to Lovers', display_emoji: '⚔️' } },
+                    ],
+                    series_genres: [],
+                    ratings: [],
+                    collection_series: [],
+                },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?tag_dimension=trope&tag_key=enemies-to-lovers');
+
+        expect(res.body.data).toHaveLength(1);
+    });
+
+    it('does not filter by tag when only tag_dimension or only tag_key is given', async () => {
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'A', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?tag_dimension=mood');
+
+        expect(res.body.data).toHaveLength(1);
+    });
+
     it('sorts by sort=top_rated using the computed average_rating', async () => {
         mockSelectResult({
             data: [
@@ -334,6 +435,26 @@ describe('GET /series', () => {
         const res = await request(buildApp()).get('/series?genre=Romance&page=1&limit=1');
 
         expect(chain.range).not.toHaveBeenCalled();
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.pagination).toEqual({ page: 1, limit: 1, total: 2, has_more: true });
+    });
+
+    // G1-01: Moods/Tropes now call this route per-key with a small limit
+    // (e.g. limit=4 for a mood section, limit=3 for a trope's poster
+    // strip) instead of fetching the whole catalog -- tag filtering has
+    // to go through the same JS-pagination path as genre for that to work.
+    it('paginates in JS when tag_dimension+tag_key is combined with page/limit', async () => {
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'A', series_tags: [{ tags: { dimension: 'mood', value_key: 'romantic', display_label: 'Romantic' } }], series_genres: [], ratings: [], collection_series: [] },
+                { id: 2, title: 'B', series_tags: [{ tags: { dimension: 'mood', value_key: 'romantic', display_label: 'Romantic' } }], series_genres: [], ratings: [], collection_series: [] },
+                { id: 3, title: 'C', series_tags: [{ tags: { dimension: 'mood', value_key: 'sad', display_label: 'Sad' } }], series_genres: [], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?tag_dimension=mood&tag_key=romantic&page=1&limit=1');
+
         expect(res.body.data).toHaveLength(1);
         expect(res.body.pagination).toEqual({ page: 1, limit: 1, total: 2, has_more: true });
     });

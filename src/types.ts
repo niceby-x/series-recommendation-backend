@@ -26,6 +26,11 @@ export interface Series {
     poster_url: string | null;
     backdrop_url: string | null;
     created_at: string;
+    // G1-01: real release date, backfilled from the old client-side mock
+    // hash (see migrations/010_series_release_date.sql) and populated for
+    // real on new series going forward. Nullable for any row that
+    // predates the column and hasn't been backfilled yet.
+    release_date?: string | null;
     // Join results, not real columns -- present on GET /series and
     // GET /series/:id responses (see the series_tags join in src/index.ts),
     // not on a raw row from `series` itself.

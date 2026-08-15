@@ -8,6 +8,24 @@ import { getRelatedSeries } from '../services/recommendations';
 
 const router = Router();
 
+// G1-01: exact port of the frontend's lib/moodMatch.ts normalize/match
+// logic, so `tag_dimension`/`tag_key` filtering here behaves identically
+// to what MoodsAuthed/TropesAuthed used to compute client-side over the
+// full catalog. Kept in sync deliberately rather than shared as a package
+// -- if the frontend's normalization rules change, this needs to change
+// with them.
+function normalizeTagValue(value: string): string {
+    return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function tagMatchesKey(tag: { value_key?: string; display_label?: string }, key: string): boolean {
+    const normalizedKey = normalizeTagValue(key);
+    return (
+        normalizeTagValue(tag.value_key || '') === normalizedKey ||
+        normalizeTagValue(tag.display_label || '') === normalizedKey
+    );
+}
+
 //Route 2 - Get ALL series
 // series_tags -> tags joined in and flattened to a plain `tags` array per
 // row (same flatten-the-join-table approach as the genre join below and
@@ -30,15 +48,26 @@ const router = Router();
 //   episode_min / episode_max -- inclusive range on episode_count
 //   rating_min   -- minimum average_rating (series with no ratings yet,
 //                   average_rating: null, never match a rating_min filter)
-//   sort         -- 'newest' | 'top_rated' | 'hidden_gems' | 'popular'
-//                   (omit for a stable default order by id -- see D2-04)
+//   release_date_min / release_date_max -- inclusive range on release_date
+//                   (real column, see migrations/010_series_release_date.sql)
+//   tag_dimension + tag_key -- both required together; matches a series'
+//                   real series_tags the same way lib/moodMatch.ts used to
+//                   client-side (see tagMatchesKey above) -- e.g.
+//                   ?tag_dimension=mood&tag_key=romantic for Moods,
+//                   ?tag_dimension=trope&tag_key=enemies-to-lovers for Tropes
+//   sort         -- 'newest' | 'newest_release' | 'top_rated' |
+//                   'hidden_gems' | 'popular' (omit for a stable default
+//                   order by id -- see D2-04). 'newest' orders by `year`
+//                   (Discover's existing "New" filter); 'newest_release'
+//                   orders by the real release_date column (New Releases)
 //
-// q/country/status/year_min/year_max/episode_min/episode_max, plus a
-// sort=newest request, are all pushed into the Supabase query itself since
-// they're real columns. genre, rating_min, and sort=top_rated/hidden_gems/
-// popular depend on genre_names/average_rating/rank -- fields that only
-// exist after this route's own join-flattening below -- so those are
-// applied in JS afterward instead.
+// q/country/status/year_min/year_max/episode_min/episode_max/
+// release_date_min/release_date_max, plus sort=newest or
+// sort=newest_release, are all pushed into the Supabase query itself since
+// they're real columns. genre, rating_min, tag_dimension+tag_key, and
+// sort=top_rated/hidden_gems/popular depend on genre_names/average_rating/
+// rank/tags -- fields that only exist after this route's own
+// join-flattening below -- so those are applied in JS afterward instead.
 //
 // This means pagination has to branch on whether any JS-only filter/sort
 // is in play:
@@ -66,9 +95,23 @@ router.get('/', async (req: Request, res: Response) => {
     const episodeMin = req.query.episode_min !== undefined ? parseInt(req.query.episode_min as string) : undefined;
     const episodeMax = req.query.episode_max !== undefined ? parseInt(req.query.episode_max as string) : undefined;
     const ratingMin = req.query.rating_min !== undefined ? parseFloat(req.query.rating_min as string) : undefined;
+    // G1-01: release_date is a real column (migrations/
+    // 010_series_release_date.sql), so these are pushed straight into the
+    // Supabase query below, same as year_min/year_max -- no JS-side
+    // filtering needed.
+    const releaseDateMin = typeof req.query.release_date_min === 'string' ? req.query.release_date_min : undefined;
+    const releaseDateMax = typeof req.query.release_date_max === 'string' ? req.query.release_date_max : undefined;
+    // G1-01: dimension + key filter for Moods/Tropes (e.g.
+    // ?tag_dimension=mood&tag_key=romantic), matching against the `tags`
+    // field this route already flattens below. Depends on that
+    // post-flatten shape, so -- like genre/rating_min -- this is applied
+    // in JS after the query, not pushed into the SQL query itself.
+    const tagDimension = typeof req.query.tag_dimension === 'string' ? req.query.tag_dimension : undefined;
+    const tagKey = typeof req.query.tag_key === 'string' ? req.query.tag_key : undefined;
+    const hasTagFilter = !!tagDimension && !!tagKey;
     const sort = typeof req.query.sort === 'string' ? req.query.sort : undefined;
     const computedSort = sort === 'top_rated' || sort === 'hidden_gems' || sort === 'popular';
-    const needsJsPagination = !!genre || ratingMin !== undefined || computedSort;
+    const needsJsPagination = !!genre || ratingMin !== undefined || computedSort || hasTagFilter;
 
     // P2-05: tags, genres, ratings, and curated-collection membership are
     // all pulled in as nested embeds on this one query, instead of the
@@ -100,10 +143,20 @@ router.get('/', async (req: Request, res: Response) => {
     if (yearMax !== undefined && !Number.isNaN(yearMax)) query = query.lte('year', yearMax);
     if (episodeMin !== undefined && !Number.isNaN(episodeMin)) query = query.gte('episode_count', episodeMin);
     if (episodeMax !== undefined && !Number.isNaN(episodeMax)) query = query.lte('episode_count', episodeMax);
+    if (releaseDateMin) query = query.gte('release_date', releaseDateMin);
+    if (releaseDateMax) query = query.lte('release_date', releaseDateMax);
     if (sort === 'newest') {
         // 'year' alone isn't unique -- series sharing a year would still
         // have unstable relative order without a tiebreaker.
         query = query.order('year', { ascending: false }).order('id', { ascending: true });
+    } else if (sort === 'newest_release') {
+        // G1-01: New Releases' "Just Released" ordering, now a real SQL
+        // sort on release_date instead of a full-catalog JS sort over a
+        // client-computed mock date. Distinct from sort=newest (which
+        // orders by `year`, used by Discover's own "New" filter) --
+        // deliberately not reusing that value so this doesn't change
+        // Discover's existing behavior.
+        query = query.order('release_date', { ascending: false }).order('id', { ascending: true });
     } else {
         // D2-04: previously no ORDER BY at all outside sort=newest, so the
         // .range() pagination below relied on Postgres's default row
@@ -170,6 +223,16 @@ router.get('/', async (req: Request, res: Response) => {
     }
     if (ratingMin !== undefined && !Number.isNaN(ratingMin)) {
         flattened = flattened.filter((row: any) => row.average_rating !== null && row.average_rating >= ratingMin);
+    }
+    // G1-01: Moods/Tropes real-match filtering, moved server-side from
+    // lib/moodMatch.ts's client-side seriesMatchesMoodKey/
+    // seriesMatchesTropeKey (see the ported tagMatchesKey above). Depends
+    // on the flattened `tags` array, same reason genre/rating_min are
+    // JS-side rather than pushed into the Supabase query.
+    if (hasTagFilter) {
+        flattened = flattened.filter((row: any) =>
+            (row.tags || []).some((t: any) => t.dimension === tagDimension && tagMatchesKey(t, tagKey as string))
+        );
     }
 
     // 'newest' was already pushed into the SQL .order() above (real
