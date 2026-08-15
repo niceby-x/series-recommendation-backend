@@ -218,12 +218,33 @@ describe('GET /series', () => {
         expect(chain.lte).toHaveBeenCalledWith('episode_count', 16);
     });
 
-    it('pushes sort=newest into the Supabase query as a real .order() call', async () => {
+    it('pushes sort=newest into the Supabase query as year desc, id asc (id as a tiebreaker)', async () => {
         const chain = mockSelectResult({ data: [], error: null });
 
         await request(buildApp()).get('/series?sort=newest');
 
         expect(chain.order).toHaveBeenCalledWith('year', { ascending: false });
+        expect(chain.order).toHaveBeenCalledWith('id', { ascending: true });
+    });
+
+    // D2-04: GET /series previously had no ORDER BY at all outside
+    // sort=newest, so .range()-based pagination relied on Postgres's
+    // default row order, which isn't guaranteed stable across separate
+    // queries -- a real risk of skipped/duplicated rows across pages.
+    it('orders by id as a stable default when no sort param is given', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series');
+
+        expect(chain.order).toHaveBeenCalledWith('id', { ascending: true });
+    });
+
+    it('orders by id as a stable default even when a JS-only sort is requested', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series?sort=popular');
+
+        expect(chain.order).toHaveBeenCalledWith('id', { ascending: true });
     });
 
     // genre depends on genre_names, a join-flattened field the DB query

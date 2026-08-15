@@ -31,7 +31,7 @@ const router = Router();
 //   rating_min   -- minimum average_rating (series with no ratings yet,
 //                   average_rating: null, never match a rating_min filter)
 //   sort         -- 'newest' | 'top_rated' | 'hidden_gems' | 'popular'
-//                   (omit to preserve today's unsorted DB order)
+//                   (omit for a stable default order by id -- see D2-04)
 //
 // q/country/status/year_min/year_max/episode_min/episode_max, plus a
 // sort=newest request, are all pushed into the Supabase query itself since
@@ -100,7 +100,23 @@ router.get('/', async (req: Request, res: Response) => {
     if (yearMax !== undefined && !Number.isNaN(yearMax)) query = query.lte('year', yearMax);
     if (episodeMin !== undefined && !Number.isNaN(episodeMin)) query = query.gte('episode_count', episodeMin);
     if (episodeMax !== undefined && !Number.isNaN(episodeMax)) query = query.lte('episode_count', episodeMax);
-    if (sort === 'newest') query = query.order('year', { ascending: false });
+    if (sort === 'newest') {
+        // 'year' alone isn't unique -- series sharing a year would still
+        // have unstable relative order without a tiebreaker.
+        query = query.order('year', { ascending: false }).order('id', { ascending: true });
+    } else {
+        // D2-04: previously no ORDER BY at all outside sort=newest, so the
+        // .range() pagination below relied on Postgres's default row
+        // order, which it does not guarantee to be stable across separate
+        // queries -- under concurrent writes or table maintenance this
+        // could skip or duplicate rows across pages. `id` is a real,
+        // indexed, always-unique column, so it's a safe default order for
+        // every other request shape (no sort param, or a JS-only sort like
+        // top_rated/hidden_gems/popular that re-sorts after this query
+        // anyway and just needs *some* stable base order to paginate a
+        // consistent underlying set from).
+        query = query.order('id', { ascending: true });
+    }
 
     if (hasPagination && !needsJsPagination) {
         const from = (page - 1) * limit;
@@ -160,8 +176,7 @@ router.get('/', async (req: Request, res: Response) => {
     // column). 'top_rated'/'hidden_gems'/'popular' order by
     // average_rating/rank, both computed above, not real columns an
     // .order() call could reach, so those sort here instead. No `sort`
-    // param preserves today's unordered-by-this-route behavior (D2-04
-    // covers adding a baseline ORDER BY separately).
+    // param falls through to the baseline `id` order added above (D2-04).
     if (sort === 'top_rated') {
         flattened = [...flattened].sort((a: any, b: any) => (b.average_rating ?? 0) - (a.average_rating ?? 0));
     } else if (sort === 'hidden_gems') {
