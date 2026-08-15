@@ -55,11 +55,25 @@ function buildApp() {
 // select() itself needs to be awaitable directly (no pagination -> no
 // .range() call), so this returns a real Promise with a .range() method
 // attached for the paginated case.
+//
+// D2-01: GET /series now also chains .ilike()/.eq()/.gte()/.lte()/
+// .order() onto the query for q/country/status/year/episode/sort=newest
+// filters before awaiting it (or calling .range()) -- each needs to
+// return the same chainable/awaitable object so the route's builder
+// pattern (`query = query.eq(...)`) keeps working under test the same
+// way it does against the real Supabase client.
 function mockSelectResult(result: { data: any[]; error: null; count?: number | null }) {
-    const promise = Object.assign(Promise.resolve(result), {
+    const chainable: any = {
+        then: (resolve: any) => Promise.resolve(result).then(resolve),
+        ilike: vi.fn(() => chainable),
+        eq: vi.fn(() => chainable),
+        gte: vi.fn(() => chainable),
+        lte: vi.fn(() => chainable),
+        order: vi.fn(() => chainable),
         range: vi.fn(() => Promise.resolve(result)),
-    });
-    selectMock.mockReturnValue(promise);
+    };
+    selectMock.mockReturnValue(chainable);
+    return chainable;
 }
 
 describe('GET /series', () => {
@@ -183,6 +197,124 @@ describe('GET /series', () => {
         const res = await request(buildApp()).get('/series');
 
         expect(res.body.pagination).toBeUndefined();
+    });
+
+    // D2-01: q/country/status/year_min/year_max/episode_min/episode_max
+    // are real columns and get pushed straight into the Supabase query
+    // builder, rather than filtered in JS.
+    it('pushes q/country/status/year/episode filters into the Supabase query builder', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get(
+            '/series?q=cherry&country=Thailand&status=airing&year_min=2020&year_max=2024&episode_min=8&episode_max=16'
+        );
+
+        expect(chain.ilike).toHaveBeenCalledWith('title', '%cherry%');
+        expect(chain.eq).toHaveBeenCalledWith('country', 'Thailand');
+        expect(chain.eq).toHaveBeenCalledWith('status', 'airing');
+        expect(chain.gte).toHaveBeenCalledWith('year', 2020);
+        expect(chain.lte).toHaveBeenCalledWith('year', 2024);
+        expect(chain.gte).toHaveBeenCalledWith('episode_count', 8);
+        expect(chain.lte).toHaveBeenCalledWith('episode_count', 16);
+    });
+
+    it('pushes sort=newest into the Supabase query as a real .order() call', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series?sort=newest');
+
+        expect(chain.order).toHaveBeenCalledWith('year', { ascending: false });
+    });
+
+    // genre depends on genre_names, a join-flattened field the DB query
+    // itself never sees -- filtered in JS after flattening instead.
+    it('filters by genre against the flattened genre_names, in JS', async () => {
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'Romance Pick', series_tags: [], series_genres: [{ genres: { name: 'Romance' } }], ratings: [], collection_series: [] },
+                { id: 2, title: 'Comedy Pick', series_tags: [], series_genres: [{ genres: { name: 'Comedy' } }], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?genre=Romance');
+
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.data[0].id).toBe(1);
+    });
+
+    // rating_min depends on average_rating, also only computed post-flatten
+    // -- a series with no ratings yet (average_rating: null) should never
+    // match a rating_min filter.
+    it('filters by rating_min against the computed average_rating, excluding unrated series', async () => {
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'High Rated', series_tags: [], series_genres: [], ratings: [{ score: 9 }, { score: 10 }], collection_series: [] },
+                { id: 2, title: 'Low Rated', series_tags: [], series_genres: [], ratings: [{ score: 3 }], collection_series: [] },
+                { id: 3, title: 'Unrated', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?rating_min=8');
+
+        expect(res.body.data.map((s: any) => s.id)).toEqual([1]);
+    });
+
+    it('sorts by sort=top_rated using the computed average_rating', async () => {
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'Mid', series_tags: [], series_genres: [], ratings: [{ score: 6 }], collection_series: [] },
+                { id: 2, title: 'Best', series_tags: [], series_genres: [], ratings: [{ score: 10 }], collection_series: [] },
+                { id: 3, title: 'Worst', series_tags: [], series_genres: [], ratings: [{ score: 2 }], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?sort=top_rated');
+
+        expect(res.body.data.map((s: any) => s.id)).toEqual([2, 1, 3]);
+    });
+
+    it('sorts by sort=popular using rank, with null ranks (no snapshot yet) sorted last', async () => {
+        getRankTrendsMock.mockResolvedValue(new Map([
+            [1, { rank: 2, trend: 'flat' }],
+            [3, { rank: 1, trend: 'up' }],
+        ]));
+        mockSelectResult({
+            data: [
+                { id: 1, title: 'Rank Two', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+                { id: 2, title: 'No Snapshot', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+                { id: 3, title: 'Rank One', series_tags: [], series_genres: [], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?sort=popular');
+
+        expect(res.body.data.map((s: any) => s.id)).toEqual([3, 1, 2]);
+    });
+
+    // When a JS-only filter/sort (genre/rating_min/top_rated/hidden_gems/
+    // popular) is combined with pagination, the DB can't paginate itself
+    // (see needsJsPagination) -- total/has_more should reflect the
+    // JS-filtered length, not a DB count, and .range() should never be
+    // called since the full matching set has to be fetched first.
+    it('paginates in JS (not via .range()) when a JS-only filter is combined with page/limit', async () => {
+        const chain = mockSelectResult({
+            data: [
+                { id: 1, title: 'A', series_tags: [], series_genres: [{ genres: { name: 'Romance' } }], ratings: [], collection_series: [] },
+                { id: 2, title: 'B', series_tags: [], series_genres: [{ genres: { name: 'Romance' } }], ratings: [], collection_series: [] },
+                { id: 3, title: 'C', series_tags: [], series_genres: [{ genres: { name: 'Comedy' } }], ratings: [], collection_series: [] },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/series?genre=Romance&page=1&limit=1');
+
+        expect(chain.range).not.toHaveBeenCalled();
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.pagination).toEqual({ page: 1, limit: 1, total: 2, has_more: true });
     });
 });
 

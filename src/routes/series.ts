@@ -16,21 +16,59 @@ const router = Router();
 // real to match series against and fell back to purely positional mock
 // data. Purely additive: existing consumers that don't read `tags` are
 // unaffected.
-// Route 2 - Get all series (optionally paginated)
+// Route 2 - Get all series (optionally filtered, sorted, and paginated)
 //
-// Pagination is opt-in via `page`/`limit` query params rather than a
-// forced default: 12 different frontend pages currently call this route
-// expecting the full catalog back (they do their own client-side
-// filtering/sorting over it), and none of them are in scope here -- so an
-// unrequested default limit would silently truncate every one of those
-// pages, which isn't something this task should do as a side effect.
-// Passing `page`/`limit` genuinely paginates via Supabase's .range() and
-// returns a `pagination` block; omitting them preserves today's full-list
-// behavior exactly.
+// D2-01: search/filter/sort moved server-side instead of the frontend's
+// client-side .filter()/.sort() over whatever page happens to be loaded.
+// Supported query params (all optional, all combine with AND):
+//   q            -- case-insensitive substring match on title
+//   country      -- exact match
+//   genre        -- exact match against a series' genre_names
+//   year_min / year_max   -- inclusive range on the year column (pass the
+//                             same value to both for an exact-year match)
+//   status       -- 'airing' | 'completed' | 'upcoming', exact match
+//   episode_min / episode_max -- inclusive range on episode_count
+//   rating_min   -- minimum average_rating (series with no ratings yet,
+//                   average_rating: null, never match a rating_min filter)
+//   sort         -- 'newest' | 'top_rated' | 'hidden_gems' | 'popular'
+//                   (omit to preserve today's unsorted DB order)
+//
+// q/country/status/year_min/year_max/episode_min/episode_max, plus a
+// sort=newest request, are all pushed into the Supabase query itself since
+// they're real columns. genre, rating_min, and sort=top_rated/hidden_gems/
+// popular depend on genre_names/average_rating/rank -- fields that only
+// exist after this route's own join-flattening below -- so those are
+// applied in JS afterward instead.
+//
+// This means pagination has to branch on whether any JS-only filter/sort
+// is in play:
+//   - none of them requested -> keep the original DB-level .range() +
+//     count: 'exact' behavior exactly (one page fetched, not the table)
+//   - genre / rating_min / a computed sort requested -> the DB can't
+//     apply that filter/order itself, so this fetches the full
+//     SQL-filtered set, filters/sorts it in JS, then paginates via
+//     .slice() -- total/has_more are computed off that JS-filtered length
+//
+// Pagination itself stays opt-in via `page`/`limit`, same as before: other
+// pages call this route expecting the full (now optionally filtered) list
+// back, so an unrequested default limit would still silently truncate them.
 router.get('/', async (req: Request, res: Response) => {
     const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
+
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const country = typeof req.query.country === 'string' ? req.query.country : undefined;
+    const genre = typeof req.query.genre === 'string' ? req.query.genre : undefined;
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    const yearMin = req.query.year_min !== undefined ? parseInt(req.query.year_min as string) : undefined;
+    const yearMax = req.query.year_max !== undefined ? parseInt(req.query.year_max as string) : undefined;
+    const episodeMin = req.query.episode_min !== undefined ? parseInt(req.query.episode_min as string) : undefined;
+    const episodeMax = req.query.episode_max !== undefined ? parseInt(req.query.episode_max as string) : undefined;
+    const ratingMin = req.query.rating_min !== undefined ? parseFloat(req.query.rating_min as string) : undefined;
+    const sort = typeof req.query.sort === 'string' ? req.query.sort : undefined;
+    const computedSort = sort === 'top_rated' || sort === 'hidden_gems' || sort === 'popular';
+    const needsJsPagination = !!genre || ratingMin !== undefined || computedSort;
 
     // P2-05: tags, genres, ratings, and curated-collection membership are
     // all pulled in as nested embeds on this one query, instead of the
@@ -52,10 +90,19 @@ router.get('/', async (req: Request, res: Response) => {
             series_genres (genres (name)),
             ratings (score),
             collection_series (collection_id, collections (is_curated))`,
-            hasPagination ? { count: 'exact' } : {}
+            hasPagination && !needsJsPagination ? { count: 'exact' } : {}
         );
 
-    if (hasPagination) {
+    if (q) query = query.ilike('title', `%${q}%`);
+    if (country) query = query.eq('country', country);
+    if (status) query = query.eq('status', status);
+    if (yearMin !== undefined && !Number.isNaN(yearMin)) query = query.gte('year', yearMin);
+    if (yearMax !== undefined && !Number.isNaN(yearMax)) query = query.lte('year', yearMax);
+    if (episodeMin !== undefined && !Number.isNaN(episodeMin)) query = query.gte('episode_count', episodeMin);
+    if (episodeMax !== undefined && !Number.isNaN(episodeMax)) query = query.lte('episode_count', episodeMax);
+    if (sort === 'newest') query = query.order('year', { ascending: false });
+
+    if (hasPagination && !needsJsPagination) {
         const from = (page - 1) * limit;
         const to = from + limit - 1;
         query = query.range(from, to);
@@ -74,7 +121,7 @@ router.get('/', async (req: Request, res: Response) => {
     // treat null as "no trend data," not as "unchanged."
     const rankTrends = await getRankTrends();
 
-    const flattened = data.map((row: any) => {
+    let flattened = data.map((row: any) => {
         const { series_tags, series_genres, ratings, collection_series, ...rest } = row;
         const tags = (series_tags || []).map((t: any) => t.tags).filter(Boolean);
         const genre_names = (series_genres || []).map((g: any) => g.genres?.name).filter(Boolean);
@@ -99,16 +146,57 @@ router.get('/', async (req: Request, res: Response) => {
         };
     });
 
+    // genre and rating_min depend on fields that only exist post-flatten
+    // (genre_names, average_rating) -- can't be pushed into the Supabase
+    // query above, so they're applied here instead.
+    if (genre) {
+        flattened = flattened.filter((row: any) => (row.genre_names || []).includes(genre));
+    }
+    if (ratingMin !== undefined && !Number.isNaN(ratingMin)) {
+        flattened = flattened.filter((row: any) => row.average_rating !== null && row.average_rating >= ratingMin);
+    }
+
+    // 'newest' was already pushed into the SQL .order() above (real
+    // column). 'top_rated'/'hidden_gems'/'popular' order by
+    // average_rating/rank, both computed above, not real columns an
+    // .order() call could reach, so those sort here instead. No `sort`
+    // param preserves today's unordered-by-this-route behavior (D2-04
+    // covers adding a baseline ORDER BY separately).
+    if (sort === 'top_rated') {
+        flattened = [...flattened].sort((a: any, b: any) => (b.average_rating ?? 0) - (a.average_rating ?? 0));
+    } else if (sort === 'hidden_gems') {
+        flattened = [...flattened].sort((a: any, b: any) => (a.average_rating ?? 0) - (b.average_rating ?? 0));
+    } else if (sort === 'popular') {
+        // Nulls (no rank-snapshot data yet) sort last, not first.
+        flattened = [...flattened].sort((a: any, b: any) => {
+            if (a.rank === null && b.rank === null) return 0;
+            if (a.rank === null) return 1;
+            if (b.rank === null) return -1;
+            return a.rank - b.rank;
+        });
+    }
+
+    // needsJsPagination: the DB couldn't filter/sort/paginate this request
+    // itself (see above), so total/has_more come from the JS-filtered
+    // array length and pagination is a .slice() over it. Otherwise this
+    // mirrors the original behavior exactly: total comes from the DB's
+    // exact count, and `data` is already just the one page Supabase's
+    // own .range() returned.
+    const paged = hasPagination && needsJsPagination
+        ? flattened.slice((page - 1) * limit, (page - 1) * limit + limit)
+        : flattened;
+    const total = needsJsPagination ? flattened.length : (count ?? flattened.length);
+
     const response: ApiResponse<Series[]> & { pagination?: { page: number; limit: number; total: number; has_more: boolean } } = {
         message: 'List of BL Series',
-        count: flattened.length,
-        data: flattened,
+        count: paged.length,
+        data: paged,
         ...(hasPagination && {
             pagination: {
                 page,
                 limit,
-                total: count ?? flattened.length,
-                has_more: page * limit < (count ?? 0),
+                total,
+                has_more: page * limit < total,
             },
         }),
     };
