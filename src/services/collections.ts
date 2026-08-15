@@ -20,34 +20,47 @@ import { requireAdmin, getOrCreateUserId } from '../middleware/auth';
 // G1-02: `pagination`, when given, pushes page/limit into the initial
 // `collections` query itself (a real .range() + count: 'exact', same as
 // GET /series' own baseline fast path) rather than fetching every
-// matching collection and slicing in JS. Safe to do at the SQL level
-// here -- unlike GET /series' genre/rating_min filters, is_curated/
-// owner_user_id are plain column equality the DB can already filter on,
-// and series_count/progress_pct are computed per-collection from its own
-// collection_series join, not aggregated across collections -- so
-// fetching only one page's worth up front doesn't corrupt anything the
-// way a partial catalog fetch would for Moods/Tropes (see G1-01).
-// Omitted (the admin router's own call, and any caller not ready to
-// paginate) keeps fetching every matching collection, exactly as before.
+// matching collection and slicing in JS. Safe to do at the SQL level for
+// `sort=updated`/`alpha` -- unlike GET /series' genre/rating_min filters,
+// is_curated/owner_user_id/title/updated_at are all plain columns the DB
+// can already filter/order on directly. `sort=most_series` is the
+// exception: series_count is computed per-collection from its own
+// collection_series join below, the same category as GET /series'
+// average_rating/rank sorts -- so that one JS-sorts the full matching set
+// first (same needsJsPagination pattern GET /series already uses) and
+// slices afterward instead. Omitted pagination (the admin router's own
+// call, and any caller not ready to paginate) keeps fetching every
+// matching collection, exactly as before.
 export async function fetchCollectionsJoined(
     filter: { is_curated: boolean; owner_user_id?: number },
     requestingUserId: number | null,
-    pagination?: { page: number; limit: number }
+    pagination?: { page: number; limit: number },
+    sort?: 'updated' | 'alpha' | 'most_series'
 ) {
+    const needsJsSort = sort === 'most_series';
+
     let query = supabase
         .from('collections')
         .select(
             'id, title, description, is_curated, owner_user_id, created_at, updated_at, collection_series (series_id)',
-            pagination ? { count: 'exact' } : undefined
+            pagination && !needsJsSort ? { count: 'exact' } : undefined
         )
-        .eq('is_curated', filter.is_curated)
-        .order('updated_at', { ascending: false });
+        .eq('is_curated', filter.is_curated);
 
     if (filter.owner_user_id !== undefined) {
         query = query.eq('owner_user_id', filter.owner_user_id);
     }
 
-    if (pagination) {
+    if (sort === 'alpha') {
+        query = query.order('title', { ascending: true });
+    } else {
+        // Default ('updated', or unset) -- also the base order for the
+        // most_series JS-fallback fetch below; it gets re-sorted in JS
+        // regardless, this just keeps the pre-sort order sane.
+        query = query.order('updated_at', { ascending: false });
+    }
+
+    if (pagination && !needsJsSort) {
         const from = (pagination.page - 1) * pagination.limit;
         const to = from + pagination.limit - 1;
         query = query.range(from, to);
@@ -93,7 +106,23 @@ export async function fetchCollectionsJoined(
         };
     });
 
-    return { error: null, data: shaped, total: pagination ? (count ?? shaped.length) : shaped.length };
+    if (needsJsSort) {
+        shaped.sort((a, b) => b.series_count - a.series_count);
+    }
+
+    // needsJsSort: the DB fetch above intentionally skipped .range() (see
+    // above), so this is where pagination actually happens for that case
+    // -- a .slice() over the now JS-sorted full set, same relationship
+    // GET /series' own needsJsPagination has between its computed sorts
+    // and its final .slice(). Otherwise `shaped` is already just the one
+    // page the DB's own .range() returned, unchanged.
+    const paged =
+        pagination && needsJsSort
+            ? shaped.slice((pagination.page - 1) * pagination.limit, (pagination.page - 1) * pagination.limit + pagination.limit)
+            : shaped;
+    const total = pagination ? (needsJsSort ? shaped.length : (count ?? shaped.length)) : shaped.length;
+
+    return { error: null, data: paged, total };
 }
 // Helper - Load a collection and confirm the caller may modify it: the
 // owner of a personal collection, or an admin for a curated one. Sends the

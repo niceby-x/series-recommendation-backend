@@ -59,9 +59,9 @@ function buildApp() {
 }
 
 // G1-02: fetchCollectionsJoined itself is mocked here (its own
-// pagination/query-building logic is covered in
+// pagination/sort/query-building logic is covered in
 // services/__tests__/collections.test.ts) -- these tests are just GET
-// /collections' own request/response shaping: parsing page/limit,
+// /collections' own request/response shaping: parsing page/limit/sort,
 // forwarding them, and building the same opt-in `pagination` envelope
 // GET /series uses.
 describe('GET /collections', () => {
@@ -76,7 +76,7 @@ describe('GET /collections', () => {
         const res = await request(buildApp()).get('/collections');
 
         expect(res.status).toBe(200);
-        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, undefined);
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, undefined, undefined);
         expect(res.body.pagination).toBeUndefined();
     });
 
@@ -86,7 +86,7 @@ describe('GET /collections', () => {
         const res = await request(buildApp()).get('/collections?page=2&limit=10');
 
         expect(res.status).toBe(200);
-        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, { page: 2, limit: 10 });
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, { page: 2, limit: 10 }, undefined);
         expect(res.body.pagination).toEqual({ page: 2, limit: 10, total: 25, has_more: true });
     });
 
@@ -100,7 +100,8 @@ describe('GET /collections', () => {
         expect(fetchCollectionsJoined).toHaveBeenCalledWith(
             { is_curated: false, owner_user_id: 9 },
             9,
-            { page: 1, limit: 20 }
+            { page: 1, limit: 20 },
+            undefined
         );
         expect(res.body.pagination).toEqual({ page: 1, limit: 20, total: 3, has_more: false });
     });
@@ -112,6 +113,22 @@ describe('GET /collections', () => {
 
         expect(res.status).toBe(401);
         expect(fetchCollectionsJoined).not.toHaveBeenCalled();
+    });
+
+    it.each(['updated', 'alpha', 'most_series'])('forwards a recognized sort value (%s)', async (sortValue) => {
+        vi.mocked(fetchCollectionsJoined).mockResolvedValue({ error: null, data: [], total: 0 });
+
+        await request(buildApp()).get('/collections?sort=' + sortValue);
+
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, undefined, sortValue);
+    });
+
+    it('ignores an unrecognized sort value rather than passing it through', async () => {
+        vi.mocked(fetchCollectionsJoined).mockResolvedValue({ error: null, data: [], total: 0 });
+
+        await request(buildApp()).get('/collections?sort=nonsense');
+
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, undefined, undefined);
     });
 });
 

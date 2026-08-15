@@ -40,7 +40,15 @@ const addSeriesToCollectionSchema = z.object({
 //
 // G1-02: pagination is opt-in via page/limit, same convention as GET
 // /series (see that route's own header comment) -- omit both and every
-// matching collection comes back, exactly as before.
+// matching collection comes back, exactly as before. `sort` (updated |
+// alpha | most_series, default updated) backs the Collections page's own
+// sort dropdown -- it has to be a real query param rather than a
+// frontend-only reorder once pagination is in play, or "Most Series"/"A-Z"
+// would only be reordering whatever happened to be on the current page
+// instead of the true full-catalog order (see fetchCollectionsJoined's
+// own header comment for how each sort value is actually computed).
+const COLLECTION_SORTS = ['updated', 'alpha', 'most_series'] as const;
+
 router.get('/', async (req: Request, res: Response) => {
     const requestingUserId = await getOrCreateUserId(req.headers.authorization);
 
@@ -48,6 +56,7 @@ router.get('/', async (req: Request, res: Response) => {
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
     const pagination = hasPagination ? { page, limit } : undefined;
+    const sort = COLLECTION_SORTS.includes(req.query.sort as any) ? (req.query.sort as (typeof COLLECTION_SORTS)[number]) : undefined;
 
     if (req.query.mine === 'true') {
         if (requestingUserId === null) {
@@ -56,7 +65,8 @@ router.get('/', async (req: Request, res: Response) => {
         const { error, data, total } = await fetchCollectionsJoined(
             { is_curated: false, owner_user_id: requestingUserId },
             requestingUserId,
-            pagination
+            pagination,
+            sort
         );
         if (error) return res.status(500).json({ message: error.message });
         return res.json({
@@ -67,7 +77,7 @@ router.get('/', async (req: Request, res: Response) => {
         });
     }
 
-    const { error, data, total } = await fetchCollectionsJoined({ is_curated: true }, requestingUserId, pagination);
+    const { error, data, total } = await fetchCollectionsJoined({ is_curated: true }, requestingUserId, pagination, sort);
     if (error) return res.status(500).json({ message: error.message });
     res.json({
         message: 'Curated collections',
