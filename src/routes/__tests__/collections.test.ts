@@ -48,6 +48,7 @@ vi.mock('../../services/collections', () => ({
 }));
 
 import { getOrCreateUserId } from '../../middleware/auth';
+import { fetchCollectionsJoined } from '../../services/collections';
 import collectionsRouter from '../collections';
 
 function buildApp() {
@@ -56,6 +57,63 @@ function buildApp() {
     app.use('/collections', collectionsRouter);
     return app;
 }
+
+// G1-02: fetchCollectionsJoined itself is mocked here (its own
+// pagination/query-building logic is covered in
+// services/__tests__/collections.test.ts) -- these tests are just GET
+// /collections' own request/response shaping: parsing page/limit,
+// forwarding them, and building the same opt-in `pagination` envelope
+// GET /series uses.
+describe('GET /collections', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+    });
+
+    it('does not forward a pagination arg or include a pagination envelope when page/limit are omitted', async () => {
+        vi.mocked(fetchCollectionsJoined).mockResolvedValue({ error: null, data: [{ id: 1 }] as any, total: 1 });
+
+        const res = await request(buildApp()).get('/collections');
+
+        expect(res.status).toBe(200);
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, undefined);
+        expect(res.body.pagination).toBeUndefined();
+    });
+
+    it('forwards page/limit and includes a pagination envelope when given', async () => {
+        vi.mocked(fetchCollectionsJoined).mockResolvedValue({ error: null, data: [{ id: 1 }] as any, total: 25 });
+
+        const res = await request(buildApp()).get('/collections?page=2&limit=10');
+
+        expect(res.status).toBe(200);
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith({ is_curated: true }, null, { page: 2, limit: 10 });
+        expect(res.body.pagination).toEqual({ page: 2, limit: 10, total: 25, has_more: true });
+    });
+
+    it('applies the same pagination envelope to ?mine=true', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(9);
+        vi.mocked(fetchCollectionsJoined).mockResolvedValue({ error: null, data: [{ id: 1 }] as any, total: 3 });
+
+        const res = await request(buildApp()).get('/collections?mine=true&page=1&limit=20');
+
+        expect(res.status).toBe(200);
+        expect(fetchCollectionsJoined).toHaveBeenCalledWith(
+            { is_curated: false, owner_user_id: 9 },
+            9,
+            { page: 1, limit: 20 }
+        );
+        expect(res.body.pagination).toEqual({ page: 1, limit: 20, total: 3, has_more: false });
+    });
+
+    it('still requires auth for ?mine=true regardless of pagination params', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+
+        const res = await request(buildApp()).get('/collections?mine=true&page=1&limit=20');
+
+        expect(res.status).toBe(401);
+        expect(fetchCollectionsJoined).not.toHaveBeenCalled();
+    });
+});
 
 describe('POST /collections', () => {
     beforeEach(() => {

@@ -16,13 +16,30 @@ import { requireAdmin, getOrCreateUserId } from '../middleware/auth';
 // owner, a real progress_pct computed from that user's own user_lists
 // status -- not meaningful for a curated collection (it isn't "your"
 // watchlist), so progress_pct is always null there.
+//
+// G1-02: `pagination`, when given, pushes page/limit into the initial
+// `collections` query itself (a real .range() + count: 'exact', same as
+// GET /series' own baseline fast path) rather than fetching every
+// matching collection and slicing in JS. Safe to do at the SQL level
+// here -- unlike GET /series' genre/rating_min filters, is_curated/
+// owner_user_id are plain column equality the DB can already filter on,
+// and series_count/progress_pct are computed per-collection from its own
+// collection_series join, not aggregated across collections -- so
+// fetching only one page's worth up front doesn't corrupt anything the
+// way a partial catalog fetch would for Moods/Tropes (see G1-01).
+// Omitted (the admin router's own call, and any caller not ready to
+// paginate) keeps fetching every matching collection, exactly as before.
 export async function fetchCollectionsJoined(
     filter: { is_curated: boolean; owner_user_id?: number },
-    requestingUserId: number | null
+    requestingUserId: number | null,
+    pagination?: { page: number; limit: number }
 ) {
     let query = supabase
         .from('collections')
-        .select('id, title, description, is_curated, owner_user_id, created_at, updated_at, collection_series (series_id)')
+        .select(
+            'id, title, description, is_curated, owner_user_id, created_at, updated_at, collection_series (series_id)',
+            pagination ? { count: 'exact' } : undefined
+        )
         .eq('is_curated', filter.is_curated)
         .order('updated_at', { ascending: false });
 
@@ -30,8 +47,14 @@ export async function fetchCollectionsJoined(
         query = query.eq('owner_user_id', filter.owner_user_id);
     }
 
-    const { data, error } = await query;
-    if (error || !data) return { error, data: [] as any[] };
+    if (pagination) {
+        const from = (pagination.page - 1) * pagination.limit;
+        const to = from + pagination.limit - 1;
+        query = query.range(from, to);
+    }
+
+    const { data, error, count } = await query;
+    if (error || !data) return { error, data: [] as any[], total: 0 };
 
     const allSeriesIds = [...new Set(data.flatMap((c: any) => (c.collection_series || []).map((cs: any) => cs.series_id)))];
 
@@ -70,7 +93,7 @@ export async function fetchCollectionsJoined(
         };
     });
 
-    return { error: null, data: shaped };
+    return { error: null, data: shaped, total: pagination ? (count ?? shaped.length) : shaped.length };
 }
 // Helper - Load a collection and confirm the caller may modify it: the
 // owner of a personal collection, or an admin for a curated one. Sends the

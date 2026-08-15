@@ -37,21 +37,44 @@ const addSeriesToCollectionSchema = z.object({
 // admin-curated collection (public, no auth needed) -- matches the "All
 // Collections" / "My Collections" filter chips on the Collections page,
 // which fetches each separately rather than one mixed list.
+//
+// G1-02: pagination is opt-in via page/limit, same convention as GET
+// /series (see that route's own header comment) -- omit both and every
+// matching collection comes back, exactly as before.
 router.get('/', async (req: Request, res: Response) => {
     const requestingUserId = await getOrCreateUserId(req.headers.authorization);
+
+    const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit as string) || 20));
+    const pagination = hasPagination ? { page, limit } : undefined;
 
     if (req.query.mine === 'true') {
         if (requestingUserId === null) {
             return res.status(401).json({ message: 'You must be signed in to view your collections.' });
         }
-        const { error, data } = await fetchCollectionsJoined({ is_curated: false, owner_user_id: requestingUserId }, requestingUserId);
+        const { error, data, total } = await fetchCollectionsJoined(
+            { is_curated: false, owner_user_id: requestingUserId },
+            requestingUserId,
+            pagination
+        );
         if (error) return res.status(500).json({ message: error.message });
-        return res.json({ message: 'Your collections', count: data.length, data });
+        return res.json({
+            message: 'Your collections',
+            count: data.length,
+            data,
+            ...(hasPagination && { pagination: { page, limit, total, has_more: page * limit < total } }),
+        });
     }
 
-    const { error, data } = await fetchCollectionsJoined({ is_curated: true }, requestingUserId);
+    const { error, data, total } = await fetchCollectionsJoined({ is_curated: true }, requestingUserId, pagination);
     if (error) return res.status(500).json({ message: error.message });
-    res.json({ message: 'Curated collections', count: data.length, data });
+    res.json({
+        message: 'Curated collections',
+        count: data.length,
+        data,
+        ...(hasPagination && { pagination: { page, limit, total, has_more: page * limit < total } }),
+    });
 });
 // Route 26 - Public: one collection's detail, with its series joined in
 // (same shape as GET /series' cards, so SeriesCard/CollectionsAuthed can
