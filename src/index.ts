@@ -22,6 +22,7 @@ import adminSeriesRouter from './routes/admin/series';
 import adminCuratorPicksRouter from './routes/admin/curatorPicks';
 import adminCollectionsRouter from './routes/admin/collections';
 import adminRankSnapshotsRouter from './routes/admin/rankSnapshots';
+import adminDashboardRouter from './routes/admin/dashboard';
 
 const app = express();
 const PORT = 3001;
@@ -105,6 +106,7 @@ app.use('/admin/series', adminSeriesRouter);
 app.use('/admin/curator-picks', adminCuratorPicksRouter);
 app.use('/admin/collections', adminCollectionsRouter);
 app.use('/admin/rank-snapshots', adminRankSnapshotsRouter);
+app.use('/admin', adminDashboardRouter);
 
 // Q3-01: catch-all JSON error handler. Every route above handles its own
 // expected errors explicitly (Supabase error objects -> res.status(500).json(...)),
