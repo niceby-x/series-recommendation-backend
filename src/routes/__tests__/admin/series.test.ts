@@ -107,6 +107,55 @@ describe('PATCH /admin/series/:id', () => {
         expect(res.status).toBe(200);
     });
 
+    describe('episode_count_updated_at (G3-01)', () => {
+        it('bumps episode_count_updated_at when episode_count increases', async () => {
+            queue('series', { data: { episode_count: 12 }, error: null }); // existing lookup
+            queue('series', { data: null, error: null }); // the update
+
+            const res = await request(buildApp())
+                .patch('/admin/series/1')
+                .send({ episode_count: 13 });
+
+            expect(res.status).toBe(200);
+            // One extra .from('series') call vs a plain field update --
+            // the existing-episode_count lookup this comparison needs.
+            expect(supabase.from.mock.calls.filter((c: any) => c[0] === 'series').length).toBe(2);
+        });
+
+        it('does not bump episode_count_updated_at when episode_count is unchanged', async () => {
+            queue('series', { data: { episode_count: 12 }, error: null }); // existing lookup
+            queue('series', { data: null, error: null }); // the update
+
+            const res = await request(buildApp())
+                .patch('/admin/series/1')
+                .send({ episode_count: 12 });
+
+            expect(res.status).toBe(200);
+        });
+
+        it('does not bump episode_count_updated_at when episode_count decreases', async () => {
+            queue('series', { data: { episode_count: 12 }, error: null }); // existing lookup
+            queue('series', { data: null, error: null }); // the update
+
+            const res = await request(buildApp())
+                .patch('/admin/series/1')
+                .send({ episode_count: 5 });
+
+            expect(res.status).toBe(200);
+        });
+
+        it('returns 500 if the existing-episode-count lookup errors', async () => {
+            queue('series', { data: null, error: { message: 'db down' } });
+
+            const res = await request(buildApp())
+                .patch('/admin/series/1')
+                .send({ episode_count: 13 });
+
+            expect(res.status).toBe(500);
+            expect(res.body.message).toBe('db down');
+        });
+    });
+
     it('is a no-op update when the body has no editable fields, tag_ids, genre_names, or collection_ids', async () => {
         const res = await request(buildApp()).patch('/admin/series/1').send({});
 

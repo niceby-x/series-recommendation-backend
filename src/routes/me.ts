@@ -221,4 +221,109 @@ router.get('/recommendations', async (req: Request, res: Response) => {
     }
 });
 
+// G3-01: the notifications bell (DashboardHeader.tsx) was fully static,
+// always rendering "You're all caught up!" regardless of real activity.
+// This wires it to real data: any series on the user's watchlist whose
+// episode_count went up (see PATCH /admin/series/:id's
+// episode_count_updated_at bump) more recently than the user last opened
+// the bell.
+//
+// Same "fetch the join, filter/sort in JS" shape as GET /watchlist and
+// GET /activity above -- PostgREST embedded-resource filters on a nested
+// select aren't reliably expressible through supabase-js for this kind of
+// "is this nullable timestamp set, and is it newer than X" check, and the
+// codebase already has this exact fallback pattern elsewhere.
+interface NotificationEntry {
+    series_id: number;
+    series_title: string;
+    poster_url: string | null;
+    episode_count: number;
+    episode_count_updated_at: string;
+}
+
+// Route - Get the logged-in user's unread "new episode" notifications for
+// their watchlisted series.
+router.get('/notifications', async (req: Request, res: Response) => {
+    const user_id = await getOrCreateUserId(req.headers.authorization);
+
+    if (!user_id) {
+        return res.status(401).json({
+            message: 'You must be signed in to view your notifications'
+        });
+    }
+
+    const { data: userRow, error: userError } = await supabase
+        .from('users')
+        .select('notifications_seen_at')
+        .eq('id', user_id)
+        .maybeSingle();
+
+    if (userError) {
+        return res.status(500).json({ message: userError.message });
+    }
+
+    const { data: watchlistRows, error: watchlistError } = await supabase
+        .from('user_lists')
+        .select('series_id, series (id, title, poster_url, episode_count, episode_count_updated_at)')
+        .eq('user_id', user_id);
+
+    if (watchlistError) {
+        return res.status(500).json({ message: watchlistError.message });
+    }
+
+    // null notifications_seen_at means "never opened the bell" -- treat
+    // every series with a real episode_count_updated_at as unread, same
+    // as a real notification inbox nobody has opened yet.
+    const seenAt = userRow?.notifications_seen_at ? new Date(userRow.notifications_seen_at).getTime() : null;
+
+    const unread: NotificationEntry[] = (watchlistRows || [])
+        .map((row: any) => row.series)
+        .filter((series: any) => {
+            if (!series?.episode_count_updated_at) return false;
+            if (seenAt === null) return true;
+            return new Date(series.episode_count_updated_at).getTime() > seenAt;
+        })
+        .map((series: any) => ({
+            series_id: series.id,
+            series_title: series.title,
+            poster_url: series.poster_url,
+            episode_count: series.episode_count,
+            episode_count_updated_at: series.episode_count_updated_at,
+        }))
+        .sort(
+            (a: NotificationEntry, b: NotificationEntry) =>
+                new Date(b.episode_count_updated_at).getTime() - new Date(a.episode_count_updated_at).getTime()
+        );
+
+    res.json({
+        message: 'Your notifications',
+        count: unread.length,
+        data: unread,
+    });
+});
+
+// Route - Mark the logged-in user's notifications as seen (called when the
+// bell is opened), so the same episode_count_updated_at bumps don't show
+// as unread again next time.
+router.post('/notifications/seen', async (req: Request, res: Response) => {
+    const user_id = await getOrCreateUserId(req.headers.authorization);
+
+    if (!user_id) {
+        return res.status(401).json({
+            message: 'You must be signed in to update your notifications'
+        });
+    }
+
+    const { error } = await supabase
+        .from('users')
+        .update({ notifications_seen_at: new Date().toISOString() })
+        .eq('id', user_id);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    res.status(200).json({ message: 'Notifications marked as seen' });
+});
+
 export default router;

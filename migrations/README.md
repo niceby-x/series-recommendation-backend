@@ -43,8 +43,11 @@ later files sometimes depend on tables/columns earlier ones create (e.g.
 | 007 | `007_series_rank_snapshots.sql` | Creates `series_rank_snapshots` | `POST /admin/rank-snapshots/run`, `GET /series`'s `rank`/`rank_trend` fields (H2-01) |
 | 008 | `008_gamification_tables.sql` | Creates `user_stats`, `user_activity_days`, `user_xp_events` | `POST /ratings`, `POST /watchlist` (fire-and-forget XP/streak recording), `GET /me/gamification` (H2-03) |
 | 009 | `009_episode_progress.sql` | Creates `user_episode_progress` | `PUT /watchlist/:seriesId/progress`, `GET /watchlist`'s `progress` field, `GET /me/activity`'s `progress` entries (H2-02) |
+| 010 | `010_series_release_date.sql` | Adds `release_date` to `series` | `GET /series`'s `release_date_min`/`release_date_max` filters and `sort=newest_release` |
+| 011 | `011_notifications_columns.sql` | Adds `episode_count_updated_at` to `series`, `notifications_seen_at` to `users` | `GET /me/notifications`, `POST /me/notifications/seen`, the `episode_count_updated_at` bump in `PATCH /admin/series/:id` (G3-01) |
 
-All nine are assumed already applied to production as of this README's
-last update -- 009 is new, run it before deploying the progress routes or
-`GET /me/activity` will 500 the moment it tries to query a table that
-doesn't exist yet.
+All eleven are assumed already applied to production as of this README's
+last update -- 011 is new, run it before deploying the notifications
+routes or `PATCH /admin/series/:id` will 500 the moment it tries to write
+a column that doesn't exist yet, and `GET /me/notifications` will 500 the
+same way reading `notifications_seen_at`.

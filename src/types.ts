@@ -31,6 +31,11 @@ export interface Series {
     // real on new series going forward. Nullable for any row that
     // predates the column and hasn't been backfilled yet.
     release_date?: string | null;
+    // G3-01: set by PATCH /admin/series/:id whenever episode_count goes up
+    // (see migrations/011_notifications_columns.sql). Null for any series
+    // that has never had an episode-count increase since this column was
+    // added -- not "unchanged," just "never bumped."
+    episode_count_updated_at?: string | null;
     // Join results, not real columns -- present on GET /series and
     // GET /series/:id responses (see the series_tags join in src/index.ts),
     // not on a raw row from `series` itself.
@@ -59,6 +64,9 @@ export interface User {
     email: string;
     password_hash?: string;
     created_at: string;
+    // G3-01: null means "never opened the notifications bell" -- see
+    // migrations/011_notifications_columns.sql and GET /me/notifications.
+    notifications_seen_at?: string | null;
 }
 
 export interface ApiResponse<T> {

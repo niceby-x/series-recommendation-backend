@@ -235,6 +235,167 @@ describe('GET /me/gamification (H2-03)', () => {
     });
 });
 
+describe('GET /me/notifications (G3-01)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('rejects a signed-out request with 401', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+
+        const res = await request(buildApp()).get('/me/notifications');
+
+        expect(res.status).toBe(401);
+        expect(res.body.message).toMatch(/must be signed in/i);
+    });
+
+    it('treats a never-opened bell (null notifications_seen_at) as everything with a real bump being unread', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('users', { data: { notifications_seen_at: null }, error: null });
+        queue('user_lists', {
+            data: [
+                {
+                    series_id: 10,
+                    series: {
+                        id: 10,
+                        title: 'Semantic Error',
+                        poster_url: '/semantic-error.jpg',
+                        episode_count: 9,
+                        episode_count_updated_at: '2026-08-10T00:00:00.000Z',
+                    },
+                },
+                {
+                    series_id: 20,
+                    series: {
+                        id: 20,
+                        title: 'Never Bumped',
+                        poster_url: null,
+                        episode_count: 12,
+                        episode_count_updated_at: null,
+                    },
+                },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/me/notifications');
+
+        expect(res.status).toBe(200);
+        expect(res.body.count).toBe(1);
+        expect(res.body.data).toEqual([
+            {
+                series_id: 10,
+                series_title: 'Semantic Error',
+                poster_url: '/semantic-error.jpg',
+                episode_count: 9,
+                episode_count_updated_at: '2026-08-10T00:00:00.000Z',
+            },
+        ]);
+    });
+
+    it('only includes series bumped after notifications_seen_at, newest first', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('users', { data: { notifications_seen_at: '2026-08-05T00:00:00.000Z' }, error: null });
+        queue('user_lists', {
+            data: [
+                {
+                    series_id: 1,
+                    series: {
+                        id: 1,
+                        title: 'Bumped Before Seen',
+                        poster_url: null,
+                        episode_count: 4,
+                        episode_count_updated_at: '2026-08-01T00:00:00.000Z',
+                    },
+                },
+                {
+                    series_id: 2,
+                    series: {
+                        id: 2,
+                        title: 'Older Bump After Seen',
+                        poster_url: null,
+                        episode_count: 6,
+                        episode_count_updated_at: '2026-08-06T00:00:00.000Z',
+                    },
+                },
+                {
+                    series_id: 3,
+                    series: {
+                        id: 3,
+                        title: 'Newest Bump After Seen',
+                        poster_url: null,
+                        episode_count: 8,
+                        episode_count_updated_at: '2026-08-12T00:00:00.000Z',
+                    },
+                },
+            ],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/me/notifications');
+
+        expect(res.status).toBe(200);
+        expect(res.body.count).toBe(2);
+        expect(res.body.data.map((n: any) => n.series_id)).toEqual([3, 2]);
+    });
+
+    it('returns 500 if the user lookup errors', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('users', { data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp()).get('/me/notifications');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+
+    it('returns 500 if the watchlist lookup errors', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('users', { data: { notifications_seen_at: null }, error: null });
+        queue('user_lists', { data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp()).get('/me/notifications');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+});
+
+describe('POST /me/notifications/seen (G3-01)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    it('rejects a signed-out request with 401', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(null);
+
+        const res = await request(buildApp()).post('/me/notifications/seen');
+
+        expect(res.status).toBe(401);
+        expect(res.body.message).toMatch(/must be signed in/i);
+    });
+
+    it('marks notifications as seen for a signed-in user', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('users', { data: null, error: null });
+
+        const res = await request(buildApp()).post('/me/notifications/seen');
+
+        expect(res.status).toBe(200);
+        expect(res.body.message).toMatch(/marked as seen/i);
+    });
+
+    it('returns 500 if the update errors', async () => {
+        vi.mocked(getOrCreateUserId).mockResolvedValue(42);
+        queue('users', { data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp()).post('/me/notifications/seen');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+});
+
 describe('GET /me/recommendations (H3-01)', () => {
     beforeEach(() => {
         vi.clearAllMocks();

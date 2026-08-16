@@ -73,6 +73,29 @@ router.patch('/:id', validateBody(editSeriesSchema), async (req: Request, res: R
         if (body[field] !== undefined) update[field] = body[field];
     }
 
+    // G3-01: bump episode_count_updated_at whenever episode_count actually
+    // goes UP -- this is what the notifications bell (GET /me/notifications)
+    // uses to detect "new episodes" on a watchlisted series. Only on an
+    // increase, not any edit that happens to touch episode_count: a
+    // correction down (fixing a miscount) or a same-value resave shouldn't
+    // notify every watchlister the way a real new episode should.
+    if (update.episode_count !== undefined) {
+        const { data: existingSeries, error: existingSeriesError } = await supabase
+            .from('series')
+            .select('episode_count')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (existingSeriesError) {
+            return res.status(500).json({ message: existingSeriesError.message });
+        }
+
+        const previousCount = existingSeries?.episode_count ?? null;
+        if (previousCount !== null && (update.episode_count as number) > previousCount) {
+            update.episode_count_updated_at = new Date().toISOString();
+        }
+    }
+
     if (Object.keys(update).length > 0) {
         const { error: updateError } = await supabase
             .from('series')
