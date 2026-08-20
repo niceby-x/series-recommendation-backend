@@ -30,6 +30,16 @@ export interface ImportRunState {
     limit: number | null;
     logTail: string[];
     error: string | null;
+    // IMP1-04: false only when the initial import_runs insert in
+    // startImportRun failed (any error other than the 23505
+    // unique_violation, which is handled separately as a conflict and
+    // never reaches this point) -- the run still proceeds untracked in
+    // that case (see the comment at that insert), but with no DB row to
+    // update, a crash mid-run leaves nothing for
+    // reconcileOrphanedImportRun() to find on the next boot. True is the
+    // default/reset value so the frontend only warns about an actual
+    // persistence failure, never a run that just hasn't started yet.
+    persisted: boolean;
 }
 
 const MAX_IMPORT_LOG_LINES = 300;
@@ -59,6 +69,7 @@ export const importRunState: ImportRunState = {
     limit: null,
     logTail: [],
     error: null,
+    persisted: true,
 };
 
 let importChild: ChildProcess | null = null;
@@ -180,6 +191,7 @@ export async function startImportRun(
     importRunState.limit = clampedLimit;
     importRunState.logTail = [];
     importRunState.error = null;
+    importRunState.persisted = true;
 
     const { data: runRow, error: insertError } = await supabase
         .from('import_runs')
@@ -203,10 +215,17 @@ export async function startImportRun(
         return { started: false, conflict: true };
     }
 
-    // Any other insert failure is IMP1-04 territory (surfacing a
-    // persisted: false warning) -- out of scope here, so the existing
-    // behavior of proceeding untracked is left as-is.
+    // IMP1-04: any other insert failure means this run proceeds
+    // untracked -- importRunDbId stays null, so persistImportLog() and
+    // the close/error handlers below skip their .update() calls, and a
+    // crash mid-run leaves no row for reconcileOrphanedImportRun() to
+    // find on the next boot. The run itself is still allowed to
+    // continue (a transient DB hiccup shouldn't block an otherwise-fine
+    // import), but importRunState.persisted flips to false so the route
+    // can surface it and the admin isn't left thinking the run's outcome
+    // is being recorded when it isn't.
     importRunDbId = insertError ? null : runRow.id;
+    importRunState.persisted = importRunDbId !== null;
 
     // Throttled rather than per-chunk -- a per-line DB write would fire
     // dozens of times a second during a real run for no real benefit,

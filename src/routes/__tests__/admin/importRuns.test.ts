@@ -144,6 +144,24 @@ describe('GET /admin/import/status', () => {
         expect(res.body.running).toBe(false);
         expect(res.body.interrupted).toBe(true);
         expect(res.body.logTail).toEqual(['a', 'b']);
+        // IMP1-04: a row that made it into import_runs obviously
+        // persisted successfully, regardless of how that run itself
+        // turned out.
+        expect(res.body.persisted).toBe(true);
+    });
+
+    // IMP1-04: importRunState.persisted is just another field on the
+    // in-memory state object, so it flows through the same spread as
+    // running/logTail/etc. in the live branch -- covered explicitly
+    // since it's the one the frontend actually needs to see false.
+    it('surfaces persisted: false from live in-memory state when the initial DB insert failed', async () => {
+        importRunStateMock.running = true;
+        importRunStateMock.persisted = false;
+
+        const res = await request(buildApp()).get('/admin/import/status');
+
+        expect(res.status).toBe(200);
+        expect(res.body.persisted).toBe(false);
     });
 
     it('falls back to the in-memory state when the import_runs table has no rows', async () => {

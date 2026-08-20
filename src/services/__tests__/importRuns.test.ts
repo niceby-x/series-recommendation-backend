@@ -13,6 +13,12 @@
 // above the max (or at/below zero) must come out clamped in the
 // returned { limit }, in importRunState.limit, and in what actually gets
 // persisted/passed to the spawned script.
+//
+// IMP1-04: also covers importRunState.persisted -- it must flip to
+// false when the initial import_runs insert fails for a reason other
+// than the 23505 conflict (which resets state and bails out before
+// persisted is ever touched), and reset back to true at the start of
+// every run and on a clean insert.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
@@ -67,6 +73,7 @@ beforeEach(() => {
     importRunState.limit = null;
     importRunState.logTail = [];
     importRunState.error = null;
+    importRunState.persisted = true;
 });
 
 describe('startImportRun', () => {
@@ -81,6 +88,7 @@ describe('startImportRun', () => {
         expect(spawnMock).toHaveBeenCalledTimes(1);
         expect(importRunState.running).toBe(true);
         expect(importRunState.limit).toBe(100);
+        expect(importRunState.persisted).toBe(true);
 
         // Let the child "finish" so its close handler clears the log
         // flush interval -- avoids leaking a live timer past this test.
@@ -115,7 +123,7 @@ describe('startImportRun', () => {
         expect(importRunState.limit).toBeNull();
     });
 
-    it('still spawns (existing IMP1-04 behavior, out of scope here) on a non-conflict insert error', async () => {
+    it('still spawns but flips persisted to false on a non-conflict insert error', async () => {
         queueInsertResult({ data: null, error: { code: '23503', message: 'some other db error' } });
         const fakeChild = makeFakeChild();
         spawnMock.mockReturnValue(fakeChild);
@@ -124,6 +132,12 @@ describe('startImportRun', () => {
 
         expect(result).toEqual({ started: true, limit: 100 });
         expect(spawnMock).toHaveBeenCalledTimes(1);
+        // IMP1-04: the run still proceeds untracked (unchanged existing
+        // behavior), but the DB row it would have needed for
+        // reconcileOrphanedImportRun() doesn't exist, so persisted must
+        // reflect that instead of silently claiming the run is being
+        // recorded.
+        expect(importRunState.persisted).toBe(false);
 
         fakeChild.emit('close', 0);
     });

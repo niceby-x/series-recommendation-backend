@@ -93,6 +93,11 @@ router.get('/status', async (req: Request, res: Response) => {
         logTail: lastRun.log ? lastRun.log.split('\n') : [],
         error: lastRun.error_message,
         interrupted: lastRun.status === 'interrupted',
+        // This branch only runs by reading a row that made it into
+        // import_runs, so persistence obviously succeeded for it --
+        // IMP1-04's persisted: false only ever comes from the live
+        // importRunState.persisted returned by the branch above.
+        persisted: true,
     });
 });
 
