@@ -298,6 +298,53 @@ router.patch('/:id', validateBody(editSeriesSchema), async (req: Request, res: R
 
     res.status(200).json({ message: 'Series updated' });
 });
+// Route 18b - Get one series' full detail for the admin edit modal (S1-02).
+// The public GET /series/:id (routes/series.ts) now gates on
+// publish_status = 'published' (see migrations/012_series_publish_status.sql)
+// -- a draft or archived title would 404 there, making it un-editable from
+// the admin table the moment it's unpublished. Same flatten shape as that
+// route (genre_names, tags, tag_ids, collection_ids, average_rating,
+// rating_count) minus the gate, so SeriesEditModal doesn't need to know
+// which route it was loaded from.
+router.get('/:id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const id = parseInt(req.params.id as string);
+
+    const { data, error } = await supabase
+        .from('series')
+        .select('*, series_genres (genres (name)), series_tags (tags (id, dimension, value_key, display_label, display_emoji))')
+        .eq('id', id)
+        .single();
+
+    if (error) {
+        return res.status(404).json({ message: 'Series not found', error });
+    }
+
+    const { series_genres, series_tags, ...rest } = data as any;
+    const genre_names = (series_genres || []).map((row: any) => row.genres?.name).filter(Boolean);
+    const tags = (series_tags || []).map((row: any) => row.tags).filter(Boolean);
+    const tag_ids = tags.map((t: any) => t.id);
+
+    const { data: ratingsRows } = await supabase.from('ratings').select('score').eq('series_id', id);
+    const scores = (ratingsRows || []).map((r: any) => r.score);
+    const average_rating = scores.length > 0 ? scores.reduce((a: number, b: number) => a + b, 0) / scores.length : null;
+    const rating_count = scores.length;
+
+    const { data: curatedMemberships } = await supabase
+        .from('collection_series')
+        .select('collection_id, collections!inner (is_curated)')
+        .eq('series_id', id)
+        .eq('collections.is_curated', true);
+    const collection_ids = (curatedMemberships || []).map((row: any) => row.collection_id);
+
+    res.json({
+        message: 'Success',
+        data: { ...rest, genre_names, tags, tag_ids, collection_ids, average_rating, rating_count },
+    });
+});
+
 // Route 19 - Permanently remove a published series (admin only). Cleans up
 // every table that references series_id first -- link tables plus
 // ratings/watchlist entries real users may have created -- rather than

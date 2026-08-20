@@ -379,6 +379,48 @@ describe('POST /admin/series/bulk', () => {
     });
 });
 
+describe('GET /admin/series/:id', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).get('/admin/series/1');
+
+        expect(res.status).toBe(403);
+    });
+
+    it('returns a draft series (no publish_status gate, unlike the public route)', async () => {
+        queue('series', {
+            data: {
+                id: 1,
+                title: 'Unpublished Draft',
+                publish_status: 'draft',
+                series_genres: [{ genres: { name: 'Drama' } }],
+                series_tags: [{ tags: { id: 5, dimension: 'mood', value_key: 'sad', display_label: 'Sad', display_emoji: '😢' } }],
+            },
+            error: null,
+        });
+        queue('ratings', { data: [{ score: 7 }], error: null });
+        queue('collection_series', { data: [{ collection_id: 9 }], error: null });
+
+        const res = await request(buildApp()).get('/admin/series/1');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.publish_status).toBe('draft');
+        expect(res.body.data.genre_names).toEqual(['Drama']);
+        expect(res.body.data.tag_ids).toEqual([5]);
+        expect(res.body.data.collection_ids).toEqual([9]);
+        expect(res.body.data.average_rating).toBe(7);
+    });
+
+    it('returns 404 if the series does not exist', async () => {
+        queue('series', { data: null, error: { message: 'not found' } });
+
+        const res = await request(buildApp()).get('/admin/series/999');
+
+        expect(res.status).toBe(404);
+    });
+});
+
 describe('DELETE /admin/series/:id', () => {
     it('rejects a non-admin with 403', async () => {
         requireAdminMock.mockImplementation(rejectAdmin());
