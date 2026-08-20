@@ -20,6 +20,7 @@ vi.mock('../../../middleware/auth', () => ({ requireAdmin: requireAdminMock }));
 vi.mock('../../../services/importRuns', () => ({
     importRunState: importRunStateMock,
     startImportRun: startImportRunMock,
+    DEFAULT_IMPORT_LIMIT: 150,
 }));
 
 const { supabase, queue } = mockSupabase();
@@ -39,9 +40,11 @@ beforeEach(() => {
     requireAdminMock.mockImplementation(allowAdmin());
     importRunStateMock.running = false;
     importRunStateMock.startedAt = null;
-    // Matches startImportRun's real return shape (IMP1-01) -- individual
-    // tests override this with a conflict result where needed.
-    startImportRunMock.mockResolvedValue({ started: true });
+    // Echoes back whatever limit the route passed in, matching
+    // startImportRun's real { started, limit } shape -- individual tests
+    // override this where the clamp (IMP1-03) or a conflict (IMP1-01)
+    // needs to be simulated.
+    startImportRunMock.mockImplementation((limit: number) => Promise.resolve({ started: true, limit }));
 });
 
 describe('POST /admin/import/run', () => {
@@ -92,6 +95,20 @@ describe('POST /admin/import/run', () => {
         const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50 });
 
         expect(res.status).toBe(409);
+    });
+
+    // IMP1-03: the route no longer trusts its own locally-computed limit
+    // for the response -- it echoes back whatever startImportRun reports
+    // as the actual (post-clamp) limit, since the clamp against
+    // MAX_IMPORT_LIMIT lives in the service, not here.
+    it('echoes back the clamped limit from startImportRun, not the requested one', async () => {
+        startImportRunMock.mockResolvedValue({ started: true, limit: 500 });
+
+        const res = await request(buildApp()).post('/admin/import/run').send({ limit: 5000 });
+
+        expect(res.status).toBe(202);
+        expect(res.body.limit).toBe(500);
+        expect(startImportRunMock).toHaveBeenCalledWith(5000);
     });
 });
 

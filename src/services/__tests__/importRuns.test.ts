@@ -7,6 +7,12 @@
 // restart that cleared this process's in-memory state without clearing
 // the DB row). Both paths must reset in-memory state and return without
 // spawning a child process; only a clean insert should reach spawn().
+//
+// IMP1-03: also covers the MAX_IMPORT_LIMIT clamp -- the single source
+// of truth for every caller lives here, not in the route, so a limit
+// above the max (or at/below zero) must come out clamped in the
+// returned { limit }, in importRunState.limit, and in what actually gets
+// persisted/passed to the spawned script.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
@@ -17,7 +23,7 @@ vi.mock('../supabase', () => ({ supabase: { from: (...args: any[]) => fromMock(.
 const spawnMock = vi.fn();
 vi.mock('child_process', () => ({ spawn: (...args: any[]) => spawnMock(...args) }));
 
-import { importRunState, startImportRun } from '../importRuns';
+import { importRunState, startImportRun, MAX_IMPORT_LIMIT } from '../importRuns';
 
 // A minimal stand-in for the ChildProcess spawn() returns -- just enough
 // (stdout/stderr as EventEmitters, plus the process's own 'close'/'error'
@@ -71,7 +77,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true });
+        expect(result).toEqual({ started: true, limit: 100 });
         expect(spawnMock).toHaveBeenCalledTimes(1);
         expect(importRunState.running).toBe(true);
         expect(importRunState.limit).toBe(100);
@@ -116,8 +122,44 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true });
+        expect(result).toEqual({ started: true, limit: 100 });
         expect(spawnMock).toHaveBeenCalledTimes(1);
+
+        fakeChild.emit('close', 0);
+    });
+
+    // IMP1-03
+    it('clamps a limit above MAX_IMPORT_LIMIT down to the max, and persists/spawns with the clamped value', async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+
+        const result = await startImportRun(MAX_IMPORT_LIMIT * 10);
+
+        expect(result).toEqual({ started: true, limit: MAX_IMPORT_LIMIT });
+        expect(importRunState.limit).toBe(MAX_IMPORT_LIMIT);
+        // The clamped value, not the requested one, is what actually
+        // gets handed to the spawned script.
+        const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+        expect(spawnArgs.some((a) => a.includes('--limit=' + MAX_IMPORT_LIMIT))).toBe(true);
+        expect(spawnArgs.some((a) => a.includes('--limit=' + MAX_IMPORT_LIMIT * 10))).toBe(false);
+
+        fakeChild.emit('close', 0);
+    });
+
+    // IMP1-03: defensive lower bound -- nothing currently in the route
+    // calls startImportRun with a non-positive limit (it defaults to
+    // DEFAULT_IMPORT_LIMIT before calling), but this is the single
+    // source of truth for every caller, so it shouldn't trust its input
+    // blindly either.
+    it('clamps a non-positive limit up to 1', async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+
+        const result = await startImportRun(0);
+
+        expect(result).toEqual({ started: true, limit: 1 });
 
         fakeChild.emit('close', 0);
     });

@@ -35,6 +35,22 @@ export interface ImportRunState {
 const MAX_IMPORT_LOG_LINES = 300;
 const LOG_PERSIST_INTERVAL_MS = 5000;
 
+// IMP1-03: the "limit per media type" input (POST /admin/import/run's
+// `limit` body param) was previously only validated as positive/non-NaN,
+// with no upper bound -- nothing stopped an admin entering an extreme
+// value and running the importer against TMDB for far longer than
+// intended. 500 is well under the script's own hard ceiling (MAX_PAGES=50
+// pages x 20 results/page = 1000 raw results per media type in
+// discover-series-by-keyword.ts, so nothing above 1000 could ever do
+// anything different anyway) while still comfortably covering a
+// deliberately large catalog-seeding run -- each accepted candidate costs
+// an extra TMDB details call on top of the page-listing calls, so the
+// cap is meant to bound worst-case run time/API usage, not just echo the
+// script's own limit. Exported so the route can clamp against the same
+// number it reports back to the frontend for the input's max attribute.
+export const DEFAULT_IMPORT_LIMIT = 150;
+export const MAX_IMPORT_LIMIT = 500;
+
 export const importRunState: ImportRunState = {
     running: false,
     startedAt: null,
@@ -110,14 +126,18 @@ export async function reconcileOrphanedImportRun() {
 // binary on every OS, so this sidesteps all of that. In a compiled build
 // the file's already plain JS, so the flag is skipped entirely -- it's not
 // needed and node would just ignore an unknown loader for a .js file.
-// Return value tells the route handler whether a run actually started.
+// Return value tells the route handler whether a run actually started
+// and, since IMP1-03, the effective (post-clamp) limit -- so the route
+// can echo back what actually happened rather than re-deriving it.
 // `conflict: true` means another run was already in progress -- either
 // caught here by the in-memory check (same process, e.g. a double-click)
 // or by the import_runs_one_running_idx partial unique index on the
 // insert below (a different process/instance, or a restart that cleared
 // this process's in-memory state without clearing the DB row). Either
 // way, no child process gets spawned on top of one that's already going.
-export async function startImportRun(limit: number): Promise<{ started: boolean; conflict?: boolean }> {
+export async function startImportRun(
+    limit: number
+): Promise<{ started: boolean; conflict?: boolean; limit?: number }> {
     // First line of defense: cheap, no DB round trip, and closes the
     // specific TOCTOU window IMP1-01 was filed for -- the route handler's
     // own `if (importRunState.running)` check happens right after
@@ -134,6 +154,13 @@ export async function startImportRun(limit: number): Promise<{ started: boolean;
         return { started: false, conflict: true };
     }
 
+    // IMP1-03: clamp here rather than only in the route, so this is the
+    // single source of truth for every caller -- including a future
+    // scheduler (IMP4-01) that might call startImportRun directly without
+    // going through the route's own request-parsing. Lower-bounded too,
+    // defensively, in case a future caller passes something <= 0.
+    const clampedLimit = Math.max(1, Math.min(limit, MAX_IMPORT_LIMIT));
+
     const runningCompiled = __filename.endsWith('.js');
     const scriptPath = path.join(
         __dirname,
@@ -143,20 +170,20 @@ export async function startImportRun(limit: number): Promise<{ started: boolean;
     );
     const command = process.platform === 'win32' ? 'node.exe' : 'node';
     const args = runningCompiled
-        ? [scriptPath, '--limit=' + limit]
-        : ['--import', 'tsx', scriptPath, '--limit=' + limit];
+        ? [scriptPath, '--limit=' + clampedLimit]
+        : ['--import', 'tsx', scriptPath, '--limit=' + clampedLimit];
 
     importRunState.running = true;
     importRunState.startedAt = new Date().toISOString();
     importRunState.finishedAt = null;
     importRunState.exitCode = null;
-    importRunState.limit = limit;
+    importRunState.limit = clampedLimit;
     importRunState.logTail = [];
     importRunState.error = null;
 
     const { data: runRow, error: insertError } = await supabase
         .from('import_runs')
-        .insert({ status: 'running', limit_per_type: limit, started_at: importRunState.startedAt })
+        .insert({ status: 'running', limit_per_type: clampedLimit, started_at: importRunState.startedAt })
         .select('id')
         .single();
 
@@ -236,5 +263,5 @@ export async function startImportRun(limit: number): Promise<{ started: boolean;
         }
     });
 
-    return { started: true };
+    return { started: true, limit: clampedLimit };
 }

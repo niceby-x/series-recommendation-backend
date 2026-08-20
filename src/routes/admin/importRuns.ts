@@ -5,7 +5,7 @@
 import { Router, Request, Response } from 'express';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
-import { importRunState, startImportRun } from '../../services/importRuns';
+import { importRunState, startImportRun, DEFAULT_IMPORT_LIMIT } from '../../services/importRuns';
 
 const router = Router();
 
@@ -26,15 +26,20 @@ router.post('/run', async (req: Request, res: Response) => {
     }
 
     const limitInput = parseInt(req.body?.limit);
-    const limit = Number.isFinite(limitInput) && limitInput > 0 ? limitInput : 150;
+    const requestedLimit = Number.isFinite(limitInput) && limitInput > 0 ? limitInput : DEFAULT_IMPORT_LIMIT;
 
-    const result = await startImportRun(limit);
+    // IMP1-03: the actual clamp against MAX_IMPORT_LIMIT happens inside
+    // startImportRun (single source of truth for every caller, including
+    // a future scheduler) -- result.limit is the post-clamp value, echoed
+    // back here so the admin sees what actually ran, not just what they
+    // requested.
+    const result = await startImportRun(requestedLimit);
 
     if (!result.started) {
         return res.status(409).json({ message: 'An import is already running.' });
     }
 
-    res.status(202).json({ message: 'Import started', limit });
+    res.status(202).json({ message: 'Import started', limit: result.limit });
 });
 // Route 17 - Poll the status and log tail of the current (or most recent)
 // discovery run (admin only). If this process has ever seen a run --
