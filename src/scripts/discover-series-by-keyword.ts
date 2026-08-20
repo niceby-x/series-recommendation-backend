@@ -218,6 +218,42 @@ function parseLimitArg(): number {
     return isNaN(parsed) ? DEFAULT_LIMIT : parsed;
 }
 
+// Supabase/PostgREST caps a single unpaginated select() at 1000 rows by default.
+// series/series_candidates can easily exceed that, which was silently truncating
+// the dedupe set below and causing "Failed to queue" unique-constraint errors for
+// titles that were already in the DB but past row #1000. Page through with .range()
+// instead so the dedupe set is always complete regardless of table size.
+async function fetchAllRows(table: 'series' | 'series_candidates'): Promise<{ title: string; tmdb_id: number | null }[]> {
+    const PAGE_SIZE = 1000;
+    let all: { title: string; tmdb_id: number | null }[] = [];
+    let from = 0;
+
+    while (true) {
+        const { data, error } = await supabase
+            .from(table)
+            .select('title, tmdb_id')
+            .range(from, from + PAGE_SIZE - 1);
+
+        if (error) {
+            throw new Error('Could not load ' + table + ': ' + error.message);
+        }
+
+        if (!data || data.length === 0) {
+            break;
+        }
+
+        all = all.concat(data);
+
+        if (data.length < PAGE_SIZE) {
+            break;
+        }
+
+        from += PAGE_SIZE;
+    }
+
+    return all;
+}
+
 async function run() {
     if (DRY_RUN) {
         console.log('Running in DRY RUN mode — nothing will be written to Supabase.\n');
@@ -233,21 +269,14 @@ async function run() {
         return;
     }
 
-    const { data: existingSeries, error: existingSeriesError } = await supabase
-        .from('series')
-        .select('title, tmdb_id');
+    let existingSeries: { title: string; tmdb_id: number | null }[];
+    let existingCandidates: { title: string; tmdb_id: number | null }[];
 
-    if (existingSeriesError) {
-        console.error('Could not load existing series: ' + existingSeriesError.message);
-        return;
-    }
-
-    const { data: existingCandidates, error: existingCandidatesError } = await supabase
-        .from('series_candidates')
-        .select('title, tmdb_id');
-
-    if (existingCandidatesError) {
-        console.error('Could not load existing candidates: ' + existingCandidatesError.message);
+    try {
+        existingSeries = await fetchAllRows('series');
+        existingCandidates = await fetchAllRows('series_candidates');
+    } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
         return;
     }
 
@@ -324,9 +353,9 @@ async function run() {
                     continue;
                 }
 
-                const { error: insertError } = await supabase
+                const { error: insertError, data: insertData } = await supabase
                     .from('series_candidates')
-                    .insert([{
+                    .upsert([{
                         title: result.title,
                         original_title: result.originalTitle || null,
                         country: resolvedCountry,
@@ -344,10 +373,17 @@ async function run() {
                         genre_names: genreNames,
                         cast_json: castJson,
                         media_type: mediaType,
-                    }]);
+                    }], { onConflict: 'tmdb_id', ignoreDuplicates: true })
+                    .select('id');
 
                 if (insertError) {
                     console.error('  Failed to queue "' + result.title + '": ' + insertError.message);
+                } else if (!insertData || insertData.length === 0) {
+                    // ignoreDuplicates means the row already existed (e.g. a concurrent run,
+                    // or something our in-memory dedupe set missed) — treat as a normal skip.
+                    console.log('  Skipping "' + result.title + '" (tmdb_id already exists — caught at insert time)');
+                    existingTitles.add(result.title);
+                    existingTmdbIds.add(result.tmdbId);
                 } else {
                     console.log('  Queued "' + result.title + '" [' + mediaType + '] (' + resolvedCountry + ', ' + result.year + ') for review');
                     countryTally[resolvedCountry] = (countryTally[resolvedCountry] || 0) + 1;
