@@ -18,6 +18,9 @@ router.post('/run', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
+    // Cheap first check, no DB round trip -- see startImportRun's insert
+    // (guarded by the import_runs_one_running_idx partial unique index,
+    // migrations/013) for the authoritative guard this backs up.
     if (importRunState.running) {
         return res.status(409).json({ message: 'An import is already running.' });
     }
@@ -25,24 +28,42 @@ router.post('/run', async (req: Request, res: Response) => {
     const limitInput = parseInt(req.body?.limit);
     const limit = Number.isFinite(limitInput) && limitInput > 0 ? limitInput : 150;
 
-    await startImportRun(limit);
+    const result = await startImportRun(limit);
+
+    if (!result.started) {
+        return res.status(409).json({ message: 'An import is already running.' });
+    }
 
     res.status(202).json({ message: 'Import started', limit });
 });
 // Route 17 - Poll the status and log tail of the current (or most recent)
-// discovery run (admin only). If this process has a run actually in
-// flight, its live in-memory state (with the live log tail) is
-// authoritative and gets returned as-is. Otherwise -- nothing running in
-// this process, whether because nothing's been started yet or because a
-// restart wiped the in-memory state mid-run -- falls back to the most
-// recent row in `import_runs`, normalized into the same shape, so the
-// frontend still shows a real last-known status (including 'interrupted'
-// if reconcileOrphanedImportRun caught a restart) instead of going blank.
+// discovery run (admin only). If this process has ever seen a run --
+// whether it's still going or just finished -- its in-memory state (with
+// the live log tail) is authoritative and gets returned as-is; see the
+// comment below for why "just finished" also needs to stay on in-memory
+// state rather than falling back to the DB. Only a process that has
+// never seen a run at all (e.g. right after boot, or after a restart
+// wiped the in-memory state) falls back to the most recent row in
+// `import_runs`, normalized into the same shape, so the frontend still
+// shows a real last-known status (including 'interrupted' if
+// reconcileOrphanedImportRun caught a restart) instead of going blank.
 router.get('/status', async (req: Request, res: Response) => {
     const isAdmin = await requireAdmin(req, res);
     if (!isAdmin) return;
 
-    if (importRunState.running) {
+    // Prefer in-memory state whenever this process has ANY record of a
+    // run -- not just while running: true. The child-process 'close'/
+    // 'error' handlers in services/importRuns.ts update import_runs in
+    // the DB, but that update is intentionally fire-and-forget (not
+    // awaited), so there's a real window right after a run finishes where
+    // importRunState.running has already flipped to false but the DB row
+    // hasn't been written yet. Falling back to the DB query in that
+    // window would read a stale row -- and since the frontend stops
+    // polling the moment it sees running: false, that stale result would
+    // never self-correct. importRunState.startedAt is only null before
+    // this process has ever seen a run start (e.g. right after boot),
+    // which is the only case that actually needs the DB fallback below.
+    if (importRunState.running || importRunState.startedAt !== null) {
         return res.json({ message: 'Import status', ...importRunState });
     }
 

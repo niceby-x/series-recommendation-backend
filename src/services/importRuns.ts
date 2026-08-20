@@ -110,7 +110,30 @@ export async function reconcileOrphanedImportRun() {
 // binary on every OS, so this sidesteps all of that. In a compiled build
 // the file's already plain JS, so the flag is skipped entirely -- it's not
 // needed and node would just ignore an unknown loader for a .js file.
-export async function startImportRun(limit: number) {
+// Return value tells the route handler whether a run actually started.
+// `conflict: true` means another run was already in progress -- either
+// caught here by the in-memory check (same process, e.g. a double-click)
+// or by the import_runs_one_running_idx partial unique index on the
+// insert below (a different process/instance, or a restart that cleared
+// this process's in-memory state without clearing the DB row). Either
+// way, no child process gets spawned on top of one that's already going.
+export async function startImportRun(limit: number): Promise<{ started: boolean; conflict?: boolean }> {
+    // First line of defense: cheap, no DB round trip, and closes the
+    // specific TOCTOU window IMP1-01 was filed for -- the route handler's
+    // own `if (importRunState.running)` check happens right after
+    // `await requireAdmin(...)`, a yield point where a second
+    // near-simultaneous request could otherwise slip through before this
+    // process had set running to true. This check-and-set runs fully
+    // synchronously (no `await` until the insert below), so once one
+    // request's continuation reaches here, JS's run-to-completion
+    // semantics mean nothing else in this process can interleave before
+    // `running` flips to true. It is NOT sufficient on its own across
+    // processes/instances -- see the insert's conflict handling below for
+    // the authoritative, DB-level guard.
+    if (importRunState.running) {
+        return { started: false, conflict: true };
+    }
+
     const runningCompiled = __filename.endsWith('.js');
     const scriptPath = path.join(
         __dirname,
@@ -137,6 +160,25 @@ export async function startImportRun(limit: number) {
         .select('id')
         .single();
 
+    // 23505 = unique_violation -- import_runs_one_running_idx
+    // (migrations/013_import_runs_running_unique.sql) rejected this insert
+    // because another row already has status = 'running'. This is the
+    // authoritative guard the in-memory check above can't fully provide:
+    // it also catches a second server instance, or a restart that cleared
+    // this process's in-memory state without clearing the DB row. Reset
+    // our own state and bail out WITHOUT spawning a child process -- two
+    // discovery scripts hitting TMDB and the candidates table at once is
+    // exactly what this is meant to prevent.
+    if (insertError?.code === '23505') {
+        importRunState.running = false;
+        importRunState.startedAt = null;
+        importRunState.limit = null;
+        return { started: false, conflict: true };
+    }
+
+    // Any other insert failure is IMP1-04 territory (surfacing a
+    // persisted: false warning) -- out of scope here, so the existing
+    // behavior of proceeding untracked is left as-is.
     importRunDbId = insertError ? null : runRow.id;
 
     // Throttled rather than per-chunk -- a per-line DB write would fire
@@ -193,4 +235,6 @@ export async function startImportRun(limit: number) {
                 .eq('id', importRunDbId);
         }
     });
+
+    return { started: true };
 }
