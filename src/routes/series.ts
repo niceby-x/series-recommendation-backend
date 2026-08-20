@@ -136,6 +136,12 @@ router.get('/', async (req: Request, res: Response) => {
             hasPagination && !needsJsPagination ? { count: 'exact' } : {}
         );
 
+    // S1-01: draft/archived titles (set via the admin Series & Movies table)
+    // are excluded from the public catalog entirely -- only 'published' rows
+    // should ever reach Discover, search, or any other public listing. See
+    // migrations/012_series_publish_status.sql.
+    query = query.eq('publish_status', 'published');
+
     if (q) query = query.ilike('title', `%${q}%`);
     if (country) query = query.eq('country', country);
     if (status) query = query.eq('status', status);
@@ -298,10 +304,14 @@ router.get('/:id', async (req: Request, res: Response) => {
     // (mirrors series_candidates' tag_ids shape) so SeriesEditModal's tag
     // picker can reuse the exact same selected-ids-as-a-Set pattern the
     // candidates Taxonomy modal already uses.
+    // S1-01: same publish_status gate as GET / above -- a draft/archived
+    // series shouldn't be reachable by direct id either, not just hidden
+    // from listings.
     const { data, error } = await supabase
         .from('series')
         .select('*, series_genres (genres (name)), series_tags (tags (id, dimension, value_key, display_label, display_emoji))')
         .eq('id', id)
+        .eq('publish_status', 'published')
         .single();
 
     if (error) {

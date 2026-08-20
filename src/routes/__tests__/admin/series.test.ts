@@ -74,6 +74,24 @@ describe('PATCH /admin/series/:id', () => {
         expect(res.status).toBe(200);
     });
 
+    it('rejects an invalid publish_status with 400', async () => {
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ publish_status: 'pending' }); // not one of draft/published/archived
+
+        expect(res.status).toBe(400);
+    });
+
+    it('accepts a valid publish_status value', async () => {
+        queue('series', { data: null, error: null });
+
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ publish_status: 'archived' });
+
+        expect(res.status).toBe(200);
+    });
+
     it('rejects a taxonomy field value outside the Taxonomy v1 enum with 400', async () => {
         const res = await request(buildApp())
             .patch('/admin/series/1')
@@ -163,6 +181,7 @@ describe('PATCH /admin/series/:id', () => {
     });
 
     it('diffs tag_ids: inserts new links and deletes ones no longer desired', async () => {
+        queue('series', { data: null, error: null }); // S1-01: array-only edits now bump updated_at/updated_by too
         queue('series_tags', { data: [{ tag_id: 1 }, { tag_id: 2 }], error: null }); // existing
         queue('series_tags', { data: null, error: null }); // insert (tag 3)
         queue('series_tags', { data: null, error: null }); // delete (tag 2)
@@ -175,6 +194,7 @@ describe('PATCH /admin/series/:id', () => {
     });
 
     it('diffs genre_names: finds-or-creates a new genre and unlinks a removed one', async () => {
+        queue('series', { data: null, error: null }); // S1-01: array-only edits now bump updated_at/updated_by too
         queue('series_genres', {
             data: [{ genre_id: 1, genres: { name: 'Romance' } }, { genre_id: 2, genres: { name: 'Drama' } }],
             error: null,
@@ -192,6 +212,7 @@ describe('PATCH /admin/series/:id', () => {
     });
 
     it('diffs collection_ids scoped to curated collections only', async () => {
+        queue('series', { data: null, error: null }); // S1-01: array-only edits now bump updated_at/updated_by too
         queue('collections', { data: [{ id: 10 }, { id: 20 }], error: null }); // curated collection ids
         queue('collection_series', { data: [{ collection_id: 10 }], error: null }); // existing memberships
         queue('collection_series', { data: null, error: null }); // add 20
@@ -202,6 +223,159 @@ describe('PATCH /admin/series/:id', () => {
             .send({ collection_ids: [10, 20] });
 
         expect(res.status).toBe(200);
+    });
+
+    it('S1-01: bumps updated_at/updated_by on an array-only edit even with no plain fields present', async () => {
+        queue('series', { data: null, error: null });
+        queue('series_tags', { data: [], error: null });
+
+        const res = await request(buildApp())
+            .patch('/admin/series/1')
+            .send({ tag_ids: [] });
+
+        expect(res.status).toBe(200);
+        expect(supabase.from.mock.calls.filter((c: any) => c[0] === 'series').length).toBe(1);
+    });
+});
+
+describe('GET /admin/series', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).get('/admin/series');
+
+        expect(res.status).toBe(403);
+    });
+
+    const baseRows = [
+        { id: 1, title: 'Revenged Love', media_type: 'tv', country: 'China', year: 2025, episode_count: 24, poster_url: null, status: 'completed', publish_status: 'published', updated_at: '2025-05-02T00:00:00Z', updated_by: 'jamie@blumi.app', series_genres: [{ genres: { name: 'Drama' } }] },
+        { id: 2, title: 'Shine', media_type: 'movie', country: 'Thailand', year: 2025, episode_count: null, poster_url: null, status: 'completed', publish_status: 'draft', updated_at: '2025-04-29T00:00:00Z', updated_by: 'jamie@blumi.app', series_genres: [{ genres: { name: 'War' } }] },
+        { id: 3, title: 'Khemjira', media_type: null, country: 'Thailand', year: 2025, episode_count: 12, poster_url: null, status: 'airing', publish_status: 'archived', updated_at: '2025-04-30T00:00:00Z', updated_by: null, series_genres: [] },
+    ];
+
+    it('returns rows, tab counts, and filter option lists off the full unfiltered set', async () => {
+        queue('series', { data: baseRows, error: null });
+
+        const res = await request(buildApp()).get('/admin/series');
+
+        expect(res.status).toBe(200);
+        expect(res.body.counts).toEqual({ all: 3, series: 2, movies: 1, drafts: 1, published: 1, archived: 1 });
+        expect(res.body.filters.countries).toEqual(['China', 'Thailand']);
+        expect(res.body.filters.genres).toEqual(['Drama', 'War']);
+        expect(res.body.data).toHaveLength(3);
+        // null media_type falls back to 'tv' (Series), not dropped or 'movie'
+        expect(res.body.data.find((r: any) => r.id === 3).media_type).toBe('tv');
+    });
+
+    it('filters by type without affecting the tab counts', async () => {
+        queue('series', { data: baseRows, error: null });
+
+        const res = await request(buildApp()).get('/admin/series').query({ type: 'movie' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(1);
+        expect(res.body.data[0].id).toBe(2);
+        expect(res.body.counts.all).toBe(3);
+    });
+
+    it('filters by publish_status', async () => {
+        queue('series', { data: baseRows, error: null });
+
+        const res = await request(buildApp()).get('/admin/series').query({ publish_status: 'draft' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.map((r: any) => r.id)).toEqual([2]);
+    });
+
+    it('paginates the filtered/sorted result', async () => {
+        queue('series', { data: baseRows, error: null });
+
+        const res = await request(buildApp()).get('/admin/series').query({ page: '1', limit: '2', sort: 'updated_desc' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(2);
+        expect(res.body.data[0].id).toBe(1); // newest updated_at first
+        expect(res.body.pagination).toEqual({ page: 1, limit: 2, total: 3, has_more: true });
+    });
+
+    it('returns 500 if the query errors', async () => {
+        queue('series', { data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp()).get('/admin/series');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
+    });
+});
+
+describe('POST /admin/series/bulk', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [1], action: 'publish' });
+
+        expect(res.status).toBe(403);
+    });
+
+    it('rejects an empty ids array with 400', async () => {
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [], action: 'publish' });
+
+        expect(res.status).toBe(400);
+    });
+
+    it('rejects an invalid action with 400', async () => {
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [1], action: 'republish' });
+
+        expect(res.status).toBe(400);
+    });
+
+    it('publishes the given ids in one update', async () => {
+        queue('series', { data: null, error: null });
+
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [1, 2], action: 'publish' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toEqual({ ids: [1, 2], action: 'publish', publish_status: 'published' });
+    });
+
+    it('archives the given ids', async () => {
+        queue('series', { data: null, error: null });
+
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [3], action: 'archive' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.publish_status).toBe('archived');
+    });
+
+    it('deletes each id via the same cascade cleanup as DELETE /:id', async () => {
+        for (const table of ['series_genres', 'series_cast', 'series_tags', 'ratings', 'user_lists', 'curator_picks', 'collection_series', 'series_rank_snapshots']) {
+            queue(table, { data: null, error: null });
+        }
+        queue('series', { data: null, error: null });
+
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [1], action: 'delete' });
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toEqual({ ids: [1], action: 'delete' });
+    });
+
+    it('stops and returns 500 if a cleanup step fails partway through a bulk delete', async () => {
+        queue('series_genres', { data: null, error: null });
+        queue('series_cast', { data: null, error: { message: 'fk violation' } });
+
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [1, 2], action: 'delete' });
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toMatch(/series_cast/);
+    });
+
+    it('returns 500 if the publish/unpublish/archive update errors', async () => {
+        queue('series', { data: null, error: { message: 'db down' } });
+
+        const res = await request(buildApp()).post('/admin/series/bulk').send({ ids: [1], action: 'unpublish' });
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db down');
     });
 });
 

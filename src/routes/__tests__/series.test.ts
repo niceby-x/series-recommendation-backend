@@ -124,6 +124,14 @@ describe('GET /series', () => {
         expect(series.collection_series).toBeUndefined();
     });
 
+    it('S1-01: filters to publish_status=published', async () => {
+        const chain = mockSelectResult({ data: [], error: null });
+
+        await request(buildApp()).get('/series');
+
+        expect(chain.eq).toHaveBeenCalledWith('publish_status', 'published');
+    });
+
     it('defaults to null average_rating and empty arrays when a series has none of the above', async () => {
         mockSelectResult({
             data: [

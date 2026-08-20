@@ -47,6 +47,21 @@ export interface Series {
     // series has no ratings to rank -- not "unchanged."
     rank?: number | null;
     rank_trend?: 'up' | 'down' | 'flat' | 'new' | null;
+    // S1-01: media_type already existed as a real column (populated by the
+    // TMDB import scripts) but was never in this interface -- 'tv' rows are
+    // "Series" and 'movie' rows are "Movies" on the admin Series & Movies
+    // table's type tabs/column. Nullable because rows created before the
+    // TMDB import existed never had it backfilled; those are treated as
+    // 'tv' throughout (see admin/series.ts).
+    media_type?: 'tv' | 'movie' | null;
+    // S1-01: publish-workflow status, distinct from `status` above (which
+    // is the show's own airing/completed/upcoming state). Gates visibility
+    // on the public GET /series and GET /series/:id routes -- only
+    // 'published' rows are publicly visible (see migrations/
+    // 012_series_publish_status.sql).
+    publish_status?: 'draft' | 'published' | 'archived';
+    updated_at?: string;
+    updated_by?: string | null;
 }
 
 export interface Rating {
