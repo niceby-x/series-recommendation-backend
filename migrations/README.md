@@ -50,10 +50,12 @@ later files sometimes depend on tables/columns earlier ones create (e.g.
 | 014 | `014_import_runs_dry_run_column.sql` | Adds `dry_run` to `import_runs` | `POST /admin/import/run`, `GET /admin/import/status` (IMP2-03) |
 | 015 | `015_import_runs_summary_column.sql` | Adds `summary` (jsonb) to `import_runs` | `GET /admin/import/status`, `GET /admin/import/history` (IMP3-01, IMP3-03) |
 | 016 | `016_import_runs_keyword_column.sql` | Adds `keyword` to `import_runs` | `POST /admin/import/run`, `GET /admin/import/status`, `GET /admin/import/history` (IMP3-02, IMP3-03) |
+| 017 | `017_import_schedule_table.sql` | Creates singleton `import_schedule` (enabled, run_hour_utc, keyword, limit_per_type, last_triggered_at) | `GET/PUT /admin/import/schedule`, the scheduler tick in `src/services/importSchedule.ts` (IMP4-01) |
 
-All sixteen are assumed already applied to production as of this README's
-last update -- 015 and 016 were backfilled into this log after the fact
-(the columns were already live; only the migration files themselves were
-missing), so there's nothing new to run for those two beyond what's
-already in Supabase. Run them anyway if you're setting up a fresh
-database from scratch.
+Sixteen of these are assumed already applied to production as of this
+README's last update -- 015 and 016 were backfilled into this log after
+the fact (the columns were already live; only the migration files
+themselves were missing), so there's nothing new to run for those two
+beyond what's already in Supabase. 017 is new and has NOT been run yet --
+run it before deploying the code that depends on it. Run everything in
+numeric order if you're setting up a fresh database from scratch.

@@ -35,6 +35,15 @@ vi.mock('../../../services/importRuns', () => ({
     DEFAULT_IMPORT_LIMIT: 150,
 }));
 
+const { getImportScheduleMock, updateImportScheduleMock } = vi.hoisted(() => ({
+    getImportScheduleMock: vi.fn(),
+    updateImportScheduleMock: vi.fn(),
+}));
+vi.mock('../../../services/importSchedule', () => ({
+    getImportSchedule: getImportScheduleMock,
+    updateImportSchedule: updateImportScheduleMock,
+}));
+
 const { supabase, queue } = mockSupabase();
 vi.mock('../../../services/supabase', () => ({ get supabase() { return supabase; } }));
 
@@ -416,5 +425,118 @@ describe('GET /admin/import/history', () => {
 
         expect(res.status).toBe(500);
         expect(res.body.message).toBe('db exploded');
+    });
+});
+
+// IMP4-01
+describe('GET /admin/import/schedule', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).get('/admin/import/schedule');
+
+        expect(res.status).toBe(403);
+        expect(getImportScheduleMock).not.toHaveBeenCalled();
+    });
+
+    it('returns the current schedule config', async () => {
+        const config = {
+            enabled: true,
+            runHourUtc: 3,
+            keyword: null,
+            limitPerType: 200,
+            lastTriggeredAt: '2026-08-20T03:00:00.000Z',
+            updatedAt: '2026-08-19T00:00:00.000Z',
+        };
+        getImportScheduleMock.mockResolvedValue(config);
+
+        const res = await request(buildApp()).get('/admin/import/schedule');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toEqual(config);
+    });
+
+    it('returns 500 when the schedule row is missing (e.g. migration not run)', async () => {
+        getImportScheduleMock.mockResolvedValue(null);
+
+        const res = await request(buildApp()).get('/admin/import/schedule');
+
+        expect(res.status).toBe(500);
+    });
+});
+
+describe('PUT /admin/import/schedule', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).put('/admin/import/schedule').send({ enabled: true, runHourUtc: 3 });
+
+        expect(res.status).toBe(403);
+        expect(updateImportScheduleMock).not.toHaveBeenCalled();
+    });
+
+    it('forwards enabled/runHourUtc/keyword/limitPerType to updateImportSchedule', async () => {
+        updateImportScheduleMock.mockResolvedValue({
+            ok: true,
+            config: { enabled: true, runHourUtc: 6, keyword: 'boys love', limitPerType: 250, lastTriggeredAt: null, updatedAt: 'now' },
+        });
+
+        const res = await request(buildApp())
+            .put('/admin/import/schedule')
+            .send({ enabled: true, runHourUtc: 6, keyword: 'boys love', limitPerType: 250 });
+
+        expect(res.status).toBe(200);
+        expect(updateImportScheduleMock).toHaveBeenCalledWith({
+            enabled: true,
+            runHourUtc: 6,
+            keyword: 'boys love',
+            limitPerType: 250,
+        });
+        expect(res.body.data).toEqual({ enabled: true, runHourUtc: 6, keyword: 'boys love', limitPerType: 250, lastTriggeredAt: null, updatedAt: 'now' });
+    });
+
+    it('defaults keyword to null and limitPerType to null when omitted or invalid', async () => {
+        updateImportScheduleMock.mockResolvedValue({
+            ok: true,
+            config: { enabled: false, runHourUtc: 0, keyword: null, limitPerType: null, lastTriggeredAt: null, updatedAt: 'now' },
+        });
+
+        const res = await request(buildApp())
+            .put('/admin/import/schedule')
+            .send({ enabled: false, runHourUtc: 0, limitPerType: -5 });
+
+        expect(res.status).toBe(200);
+        expect(updateImportScheduleMock).toHaveBeenCalledWith({
+            enabled: false,
+            runHourUtc: 0,
+            keyword: null,
+            limitPerType: null,
+        });
+    });
+
+    it('coerces a truthy/falsy enabled value with Boolean(), same as dryRun on POST /run', async () => {
+        updateImportScheduleMock.mockResolvedValue({
+            ok: true,
+            config: { enabled: false, runHourUtc: 3, keyword: null, limitPerType: null, lastTriggeredAt: null, updatedAt: 'now' },
+        });
+
+        await request(buildApp()).put('/admin/import/schedule').send({ enabled: 'false', runHourUtc: 3 });
+
+        // 'false' the string is truthy in JS -- Boolean() on it is still
+        // true, same caveat IMP2-03 already documents for dryRun; this
+        // just asserts the route applies the same coercion consistently
+        // rather than accidentally treating it as falsy.
+        expect(updateImportScheduleMock).toHaveBeenCalledWith(
+            expect.objectContaining({ enabled: true })
+        );
+    });
+
+    it('returns 400 with the validation error when updateImportSchedule rejects the input', async () => {
+        updateImportScheduleMock.mockResolvedValue({ ok: false, error: 'runHourUtc must be an integer between 0 and 23.' });
+
+        const res = await request(buildApp()).put('/admin/import/schedule').send({ enabled: true, runHourUtc: 99 });
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toBe('runHourUtc must be an integer between 0 and 23.');
     });
 });

@@ -4,6 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { reconcileOrphanedImportRun } from './services/importRuns';
+import { startImportScheduler } from './services/importSchedule';
 
 import seriesRouter from './routes/series';
 import ratingsRouter from './routes/ratings';
@@ -128,4 +129,8 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 app.listen(PORT, () => {
     console.log(`BL Series API is running at http://localhost:${PORT}`);
     reconcileOrphanedImportRun();
+    // IMP4-01: starts the recurring tick that checks whether a scheduled
+    // import is due. A no-op on every tick until an admin turns the
+    // schedule on via PUT /admin/import/schedule -- safe to always start.
+    startImportScheduler();
 });

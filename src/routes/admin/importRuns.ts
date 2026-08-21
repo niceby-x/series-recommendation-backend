@@ -6,6 +6,7 @@ import { Router, Request, Response } from 'express';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
 import { importRunState, startImportRun, stopImportRun, DEFAULT_IMPORT_LIMIT } from '../../services/importRuns';
+import { getImportSchedule, updateImportSchedule } from '../../services/importSchedule';
 
 const router = Router();
 
@@ -219,6 +220,49 @@ router.get('/history', async (req: Request, res: Response) => {
         data: runs,
         pagination: { page, limit, total, has_more: page * limit < total },
     });
+});
+
+// IMP4-01 - Read the current schedule (admin only). Response shape is the
+// contract the frontend's settings form is built against:
+// { enabled, runHourUtc, keyword, limitPerType, lastTriggeredAt, updatedAt }
+// -- keyword/limitPerType are null when unset (falls back to the same
+// defaults a manual run without those fields would use, resolved by
+// startImportRun at trigger time, not here).
+router.get('/schedule', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const config = await getImportSchedule();
+
+    if (!config) {
+        return res.status(500).json({ message: 'Import schedule is not configured. Has migrations/017_import_schedule_table.sql been run?' });
+    }
+
+    res.json({ message: 'Import schedule', data: config });
+});
+
+// IMP4-01 - Update the schedule (admin only). Body:
+// { enabled: boolean, runHourUtc: number (0-23), keyword?: string | null, limitPerType?: number | null }
+// keyword/limitPerType are optional and nullable -- omit or pass null to
+// fall back to the defaults at trigger time (see updateImportSchedule's
+// own comment on why those aren't clamped/defaulted here).
+router.put('/schedule', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const enabled = Boolean(req.body?.enabled);
+    const runHourUtc = Number(req.body?.runHourUtc);
+    const keyword = typeof req.body?.keyword === 'string' ? req.body.keyword : null;
+    const limitInput = Number(req.body?.limitPerType);
+    const limitPerType = Number.isFinite(limitInput) && limitInput > 0 ? limitInput : null;
+
+    const result = await updateImportSchedule({ enabled, runHourUtc, keyword, limitPerType });
+
+    if (!result.ok) {
+        return res.status(400).json({ message: result.error });
+    }
+
+    res.json({ message: 'Import schedule updated', data: result.config });
 });
 
 export default router;
