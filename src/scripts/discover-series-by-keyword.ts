@@ -417,8 +417,25 @@ async function run() {
                     continue;
                 }
 
-                if (existingTmdbIds.has(result.tmdbId) || existingTitles.has(result.title)) {
-                    console.log('  Skipping "' + result.title + '" (already queued or in catalog)');
+                // IMP1-06: previously one combined check/log line for
+                // both cases -- couldn't tell a correct skip (TMDB
+                // re-surfacing a show already known by tmdb_id, expected
+                // when overlapping keywords like "boys' love (bl)" and
+                // "gay romance" rediscover the same shows) apart from a
+                // title-only collision (a DIFFERENT tmdb_id whose title
+                // string happens to already exist somewhere in
+                // series/series_candidates -- existingTitles is built
+                // from the whole table, not scoped to this run's genre,
+                // so a generic title like "Bro" or "Tonight" can false-
+                // positive against an unrelated existing row). Split so a
+                // run's log makes that split visible instead of every
+                // skip looking identical.
+                if (existingTmdbIds.has(result.tmdbId)) {
+                    console.log('  Skipping "' + result.title + '" (tmdb_id ' + result.tmdbId + ' already in catalog/queue)');
+                    continue;
+                }
+                if (existingTitles.has(result.title)) {
+                    console.log('  Skipping "' + result.title + '" (title collision, tmdb_id ' + result.tmdbId + ' is NEW -- possible false positive, verify against the existing row with this title)');
                     continue;
                 }
 
