@@ -19,6 +19,12 @@
 // than the 23505 conflict (which resets state and bails out before
 // persisted is ever touched), and reset back to true at the start of
 // every run and on a clean insert.
+//
+// IMP2-01: covers stopImportRun -- a no-op returning { stopped: false }
+// when nothing is running, and otherwise sending SIGTERM to the tracked
+// child and marking importRunState.cancelled so the close handler that
+// fires once the child actually exits records status: 'cancelled'
+// (not 'error') in import_runs.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
@@ -29,7 +35,11 @@ vi.mock('../supabase', () => ({ supabase: { from: (...args: any[]) => fromMock(.
 const spawnMock = vi.fn();
 vi.mock('child_process', () => ({ spawn: (...args: any[]) => spawnMock(...args) }));
 
-import { importRunState, startImportRun, MAX_IMPORT_LIMIT } from '../importRuns';
+// Shared across queueInsertResult's returned `from('import_runs')` stub --
+// see the comment there. Defined once, reset in beforeEach.
+const updateMock = vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null }) }));
+
+import { importRunState, startImportRun, stopImportRun, MAX_IMPORT_LIMIT } from '../importRuns';
 
 // A minimal stand-in for the ChildProcess spawn() returns -- just enough
 // (stdout/stderr as EventEmitters, plus the process's own 'close'/'error'
@@ -39,6 +49,7 @@ function makeFakeChild() {
     const child: any = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    child.kill = vi.fn();
     return child;
 }
 
@@ -55,9 +66,10 @@ function queueInsertResult(result: { data: any; error: any }) {
                 // once the fake child emits close() -- stub it as a
                 // thenable no-op so those fire-and-forget calls don't
                 // throw, same as persistImportLog's own .update() would.
-                update: vi.fn(() => ({
-                    eq: vi.fn().mockResolvedValue({ error: null }),
-                })),
+                // Shared reference (not a fresh vi.fn() per call) so tests
+                // can assert on what a later close-handler update actually
+                // sent, same as they already assert on spawnMock's calls.
+                update: updateMock,
             };
         }
         throw new Error('unexpected table ' + table);
@@ -74,6 +86,7 @@ beforeEach(() => {
     importRunState.logTail = [];
     importRunState.error = null;
     importRunState.persisted = true;
+    importRunState.cancelled = false;
 });
 
 describe('startImportRun', () => {
@@ -176,5 +189,61 @@ describe('startImportRun', () => {
         expect(result).toEqual({ started: true, limit: 1 });
 
         fakeChild.emit('close', 0);
+    });
+});
+
+describe('stopImportRun', () => {
+    it('returns stopped: false without touching anything when no run is in progress', () => {
+        const result = stopImportRun();
+
+        expect(result).toEqual({ stopped: false, reason: 'not_running' });
+        expect(fromMock).not.toHaveBeenCalled();
+    });
+
+    it('sends SIGTERM to the tracked child and marks the run cancelled', async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+        await startImportRun(100);
+
+        const result = stopImportRun();
+
+        expect(result).toEqual({ stopped: true });
+        expect(fakeChild.kill).toHaveBeenCalledWith('SIGTERM');
+        expect(importRunState.cancelled).toBe(true);
+
+        fakeChild.emit('close', null);
+    });
+
+    it("records status: 'cancelled' (not 'error') once the killed child's close handler fires", async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+        await startImportRun(100);
+
+        stopImportRun();
+        // A process killed by SIGTERM reports a null exit code, not 0 --
+        // this is what would otherwise fall through to 'error' without
+        // importRunState.cancelled disambiguating it.
+        fakeChild.emit('close', null);
+
+        expect(importRunState.running).toBe(false);
+        expect(updateMock).toHaveBeenCalledWith(
+            expect.objectContaining({ status: 'cancelled', exit_code: null })
+        );
+    });
+
+    it('is a no-op if called again after the run already stopped', async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+        await startImportRun(100);
+        stopImportRun();
+        fakeChild.emit('close', null);
+
+        const second = stopImportRun();
+
+        expect(second).toEqual({ stopped: false, reason: 'not_running' });
+        expect(fakeChild.kill).toHaveBeenCalledTimes(1);
     });
 });

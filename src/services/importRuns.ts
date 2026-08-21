@@ -40,6 +40,14 @@ export interface ImportRunState {
     // default/reset value so the frontend only warns about an actual
     // persistence failure, never a run that just hasn't started yet.
     persisted: boolean;
+    // IMP2-01: true only when the current/most-recent run was ended via
+    // stopImportRun() (an admin action) rather than finishing on its own
+    // or dying with an error -- lets the close handler below record
+    // status: 'cancelled' in import_runs instead of misreporting a
+    // deliberate stop as 'error' (there's no controlled way to make a
+    // killed child process exit with code 0, so 'success' isn't right
+    // either). Reset to false at the start of every run.
+    cancelled: boolean;
 }
 
 const MAX_IMPORT_LOG_LINES = 300;
@@ -70,6 +78,7 @@ export const importRunState: ImportRunState = {
     logTail: [],
     error: null,
     persisted: true,
+    cancelled: false,
 };
 
 let importChild: ChildProcess | null = null;
@@ -192,6 +201,7 @@ export async function startImportRun(
     importRunState.logTail = [];
     importRunState.error = null;
     importRunState.persisted = true;
+    importRunState.cancelled = false;
 
     const { data: runRow, error: insertError } = await supabase
         .from('import_runs')
@@ -273,7 +283,14 @@ export async function startImportRun(
             supabase
                 .from('import_runs')
                 .update({
-                    status: code === 0 ? 'success' : 'error',
+                    // IMP2-01: a run stopped via stopImportRun() exits
+                    // with a signal, not a normal exit code -- `code` is
+                    // null in that case (Node reports the death via the
+                    // separate `signal` param this handler doesn't take),
+                    // which would otherwise fall into the 'error' bucket
+                    // and misreport a deliberate admin action as a
+                    // failure. importRunState.cancelled disambiguates it.
+                    status: importRunState.cancelled ? 'cancelled' : code === 0 ? 'success' : 'error',
                     finished_at: importRunState.finishedAt,
                     exit_code: code,
                     log: importRunState.logTail.join('\n'),
@@ -283,4 +300,24 @@ export async function startImportRun(
     });
 
     return { started: true, limit: clampedLimit };
+}
+
+// IMP2-01: importChild was already tracked module-scope for the
+// stdout/stderr/close wiring above -- it just wasn't exposed to admins
+// as a way to actually stop a run short of restarting the whole server.
+// SIGTERM (not SIGKILL) so the child gets Node's normal unhandled-signal
+// exit path rather than being killed with no chance to flush anything;
+// discover-series-by-keyword.ts doesn't register its own SIGTERM handler,
+// so this reliably ends the process. The existing 'close' handler above
+// still fires as usual once it does, and (via importRunState.cancelled,
+// set here first) records status: 'cancelled' instead of 'error'.
+export function stopImportRun(): { stopped: boolean; reason?: 'not_running' } {
+    if (!importRunState.running || !importChild) {
+        return { stopped: false, reason: 'not_running' };
+    }
+
+    importRunState.cancelled = true;
+    importChild.kill('SIGTERM');
+
+    return { stopped: true };
 }

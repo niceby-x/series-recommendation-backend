@@ -4,6 +4,11 @@
 // the single-run-at-a-time 409 guard, the limit default/validation, and
 // status falling back to the last `import_runs` row when nothing is live
 // in this process's memory.
+//
+// IMP2-01: also covers POST /admin/import/stop -- the admin-only guard,
+// the 409 when stopImportRun reports nothing was running, and the
+// `cancelled` flag on GET /status (both the live in-memory pass-through
+// and the DB-fallback branch reading status: 'cancelled').
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import express from 'express';
@@ -11,15 +16,17 @@ import request from 'supertest';
 import { mockSupabase, allowAdmin, rejectAdmin } from './testUtils';
 
 const { requireAdminMock } = vi.hoisted(() => ({ requireAdminMock: vi.fn() }));
-const { importRunStateMock, startImportRunMock } = vi.hoisted(() => ({
+const { importRunStateMock, startImportRunMock, stopImportRunMock } = vi.hoisted(() => ({
     importRunStateMock: { running: false, startedAt: null } as any,
     startImportRunMock: vi.fn(),
+    stopImportRunMock: vi.fn(),
 }));
 
 vi.mock('../../../middleware/auth', () => ({ requireAdmin: requireAdminMock }));
 vi.mock('../../../services/importRuns', () => ({
     importRunState: importRunStateMock,
     startImportRun: startImportRunMock,
+    stopImportRun: stopImportRunMock,
     DEFAULT_IMPORT_LIMIT: 150,
 }));
 
@@ -45,6 +52,9 @@ beforeEach(() => {
     // override this where the clamp (IMP1-03) or a conflict (IMP1-01)
     // needs to be simulated.
     startImportRunMock.mockImplementation((limit: number) => Promise.resolve({ started: true, limit }));
+    // Default to "something was running and got stopped" -- individual
+    // tests override this where the not_running 409 case needs covering.
+    stopImportRunMock.mockReturnValue({ stopped: true });
 });
 
 describe('POST /admin/import/run', () => {
@@ -112,6 +122,34 @@ describe('POST /admin/import/run', () => {
     });
 });
 
+describe('POST /admin/import/stop', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).post('/admin/import/stop');
+
+        expect(res.status).toBe(403);
+        expect(stopImportRunMock).not.toHaveBeenCalled();
+    });
+
+    it('sends the stop signal and returns 202 when a run is in progress', async () => {
+        stopImportRunMock.mockReturnValue({ stopped: true });
+
+        const res = await request(buildApp()).post('/admin/import/stop');
+
+        expect(res.status).toBe(202);
+        expect(stopImportRunMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns 409 when stopImportRun reports nothing was running', async () => {
+        stopImportRunMock.mockReturnValue({ stopped: false, reason: 'not_running' });
+
+        const res = await request(buildApp()).post('/admin/import/stop');
+
+        expect(res.status).toBe(409);
+    });
+});
+
 describe('GET /admin/import/status', () => {
     it('rejects a non-admin with 403', async () => {
         requireAdminMock.mockImplementation(rejectAdmin());
@@ -148,6 +186,24 @@ describe('GET /admin/import/status', () => {
         // persisted successfully, regardless of how that run itself
         // turned out.
         expect(res.body.persisted).toBe(true);
+        // IMP2-01: this row wasn't cancelled, just interrupted -- the two
+        // are distinct outcomes and shouldn't be conflated.
+        expect(res.body.cancelled).toBe(false);
+    });
+
+    // IMP2-01: mirrors the 'interrupted' fallback case just above, but
+    // for a row an admin actually stopped via POST /admin/import/stop.
+    it("reports cancelled: true from the DB fallback when the last row's status is 'cancelled'", async () => {
+        queue('import_runs', {
+            data: [{ status: 'cancelled', started_at: '2026-01-01', finished_at: '2026-01-01', exit_code: null, log: 'a', error_message: null }],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/admin/import/status');
+
+        expect(res.status).toBe(200);
+        expect(res.body.cancelled).toBe(true);
+        expect(res.body.interrupted).toBe(false);
     });
 
     // IMP1-04: importRunState.persisted is just another field on the
@@ -162,6 +218,21 @@ describe('GET /admin/import/status', () => {
 
         expect(res.status).toBe(200);
         expect(res.body.persisted).toBe(false);
+    });
+
+    // IMP2-01: importRunState.cancelled is just another field on the
+    // in-memory state object, so -- same as persisted above -- it flows
+    // through the same spread in the live branch. This is the case the
+    // frontend actually polls right after clicking Stop, before the
+    // close handler's DB update has necessarily landed.
+    it('surfaces cancelled: true from live in-memory state right after Stop is clicked', async () => {
+        importRunStateMock.running = true;
+        importRunStateMock.cancelled = true;
+
+        const res = await request(buildApp()).get('/admin/import/status');
+
+        expect(res.status).toBe(200);
+        expect(res.body.cancelled).toBe(true);
     });
 
     it('falls back to the in-memory state when the import_runs table has no rows', async () => {

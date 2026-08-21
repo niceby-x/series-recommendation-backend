@@ -5,7 +5,7 @@
 import { Router, Request, Response } from 'express';
 import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
-import { importRunState, startImportRun, DEFAULT_IMPORT_LIMIT } from '../../services/importRuns';
+import { importRunState, startImportRun, stopImportRun, DEFAULT_IMPORT_LIMIT } from '../../services/importRuns';
 
 const router = Router();
 
@@ -40,6 +40,30 @@ router.post('/run', async (req: Request, res: Response) => {
     }
 
     res.status(202).json({ message: 'Import started', limit: result.limit });
+});
+
+// IMP2-01 - Stop the currently-running import (admin only). importChild
+// was already tracked in services/importRuns.ts for the stdout/stderr/
+// close wiring; this just exposes a way to signal it short of restarting
+// the whole server. 409s the same way /run's conflict case does when
+// there's nothing to stop, so the frontend can treat both routes'
+// error shape consistently.
+router.post('/stop', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const result = stopImportRun();
+
+    if (!result.stopped) {
+        return res.status(409).json({ message: 'No import is currently running.' });
+    }
+
+    // Stopping is asynchronous -- this confirms the signal was sent, not
+    // that the process has exited yet. The frontend's existing status
+    // poll picks up running: false (and status: 'cancelled' once the
+    // close handler's DB update lands) the same way it already detects
+    // any other run ending.
+    res.status(202).json({ message: 'Stop signal sent' });
 });
 // Route 17 - Poll the status and log tail of the current (or most recent)
 // discovery run (admin only). If this process has ever seen a run --
@@ -98,6 +122,12 @@ router.get('/status', async (req: Request, res: Response) => {
         // IMP1-04's persisted: false only ever comes from the live
         // importRunState.persisted returned by the branch above.
         persisted: true,
+        // IMP2-01: mirrors the live branch's importRunState.cancelled --
+        // a run stopped by an admin is recorded as status: 'cancelled'
+        // in import_runs (see the close handler in services/importRuns.ts),
+        // so this branch can tell it apart from a normal success/error
+        // finish the same way it already does for 'interrupted'.
+        cancelled: lastRun.status === 'cancelled',
     });
 });
 
