@@ -26,6 +26,12 @@
 // fires once the child actually exits records status: 'cancelled'
 // (not 'error') in import_runs.
 
+// IMP2-03: covers dryRun -- forwarded to startImportRun's second param,
+// appended to the spawned script's argv as --dry-run, persisted on the
+// import_runs insert (migrations/014), and echoed back in the return
+// value, all only when explicitly requested (defaults to false/omitted
+// throughout otherwise).
+
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
 
@@ -38,6 +44,10 @@ vi.mock('child_process', () => ({ spawn: (...args: any[]) => spawnMock(...args) 
 // Shared across queueInsertResult's returned `from('import_runs')` stub --
 // see the comment there. Defined once, reset in beforeEach.
 const updateMock = vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null }) }));
+// Same idea, but for .insert() -- lets tests assert on exactly what was
+// persisted for the initial row (e.g. IMP2-03's dry_run), not just that
+// spawn() eventually got called.
+let insertMock: ReturnType<typeof vi.fn>;
 
 import { importRunState, startImportRun, stopImportRun, MAX_IMPORT_LIMIT } from '../importRuns';
 
@@ -54,14 +64,15 @@ function makeFakeChild() {
 }
 
 function queueInsertResult(result: { data: any; error: any }) {
+    insertMock = vi.fn(() => ({
+        select: vi.fn(() => ({
+            single: vi.fn().mockResolvedValue(result),
+        })),
+    }));
     fromMock.mockImplementation((table: string) => {
         if (table === 'import_runs') {
             return {
-                insert: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                        single: vi.fn().mockResolvedValue(result),
-                    })),
-                })),
+                insert: insertMock,
                 // The 'close'/'error' handlers fire an un-awaited .update()
                 // once the fake child emits close() -- stub it as a
                 // thenable no-op so those fire-and-forget calls don't
@@ -87,6 +98,7 @@ beforeEach(() => {
     importRunState.error = null;
     importRunState.persisted = true;
     importRunState.cancelled = false;
+    importRunState.dryRun = false;
 });
 
 describe('startImportRun', () => {
@@ -97,11 +109,15 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true, limit: 100 });
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false });
         expect(spawnMock).toHaveBeenCalledTimes(1);
         expect(importRunState.running).toBe(true);
         expect(importRunState.limit).toBe(100);
         expect(importRunState.persisted).toBe(true);
+        expect(importRunState.dryRun).toBe(false);
+        // IMP2-03: a normal (non-dry) run's insert should still persist
+        // dry_run: false explicitly, not omit the column.
+        expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({ dry_run: false }));
 
         // Let the child "finish" so its close handler clears the log
         // flush interval -- avoids leaking a live timer past this test.
@@ -143,7 +159,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true, limit: 100 });
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false });
         expect(spawnMock).toHaveBeenCalledTimes(1);
         // IMP1-04: the run still proceeds untracked (unchanged existing
         // behavior), but the DB row it would have needed for
@@ -163,7 +179,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(MAX_IMPORT_LIMIT * 10);
 
-        expect(result).toEqual({ started: true, limit: MAX_IMPORT_LIMIT });
+        expect(result).toEqual({ started: true, limit: MAX_IMPORT_LIMIT, dryRun: false });
         expect(importRunState.limit).toBe(MAX_IMPORT_LIMIT);
         // The clamped value, not the requested one, is what actually
         // gets handed to the spawned script.
@@ -186,7 +202,46 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(0);
 
-        expect(result).toEqual({ started: true, limit: 1 });
+        expect(result).toEqual({ started: true, limit: 1, dryRun: false });
+
+        fakeChild.emit('close', 0);
+    });
+});
+
+describe('startImportRun with dryRun', () => {
+    it('appends --dry-run to the spawned argv, persists dry_run: true, and echoes dryRun: true back', async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+
+        const result = await startImportRun(100, true);
+
+        expect(result).toEqual({ started: true, limit: 100, dryRun: true });
+        expect(importRunState.dryRun).toBe(true);
+        expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({ dry_run: true }));
+        const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+        expect(spawnArgs).toContain('--dry-run');
+
+        fakeChild.emit('close', 0);
+    });
+
+    it('omits --dry-run and resets importRunState.dryRun to false when the flag is left off a later run', async () => {
+        queueInsertResult({ data: { id: 42 }, error: null });
+        let fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+        await startImportRun(100, true);
+        fakeChild.emit('close', 0);
+
+        queueInsertResult({ data: { id: 43 }, error: null });
+        fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+        const result = await startImportRun(100);
+
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false });
+        expect(importRunState.dryRun).toBe(false);
+        // Second call in this test -- index 1, not 0.
+        const spawnArgs = spawnMock.mock.calls[1][1] as string[];
+        expect(spawnArgs).not.toContain('--dry-run');
 
         fakeChild.emit('close', 0);
     });

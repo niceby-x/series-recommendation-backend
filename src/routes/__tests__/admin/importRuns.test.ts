@@ -9,6 +9,11 @@
 // the 409 when stopImportRun reports nothing was running, and the
 // `cancelled` flag on GET /status (both the live in-memory pass-through
 // and the DB-fallback branch reading status: 'cancelled').
+//
+// IMP2-03: also covers the `dryRun` body param on POST /run -- forwarded
+// to startImportRun as a real boolean (never the raw body value) and
+// echoed back in the response, plus the `dryRun` field on GET /status
+// (both branches, mirroring persisted/cancelled above).
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import express from 'express';
@@ -47,11 +52,13 @@ beforeEach(() => {
     requireAdminMock.mockImplementation(allowAdmin());
     importRunStateMock.running = false;
     importRunStateMock.startedAt = null;
-    // Echoes back whatever limit the route passed in, matching
-    // startImportRun's real { started, limit } shape -- individual tests
-    // override this where the clamp (IMP1-03) or a conflict (IMP1-01)
-    // needs to be simulated.
-    startImportRunMock.mockImplementation((limit: number) => Promise.resolve({ started: true, limit }));
+    // Echoes back whatever limit/dryRun the route passed in, matching
+    // startImportRun's real { started, limit, dryRun } shape --
+    // individual tests override this where the clamp (IMP1-03) or a
+    // conflict (IMP1-01) needs to be simulated.
+    startImportRunMock.mockImplementation((limit: number, dryRun?: boolean) =>
+        Promise.resolve({ started: true, limit, dryRun: !!dryRun })
+    );
     // Default to "something was running and got stopped" -- individual
     // tests override this where the not_running 409 case needs covering.
     stopImportRunMock.mockReturnValue({ stopped: true });
@@ -80,14 +87,14 @@ describe('POST /admin/import/run', () => {
 
         expect(res.status).toBe(202);
         expect(res.body.limit).toBe(150);
-        expect(startImportRunMock).toHaveBeenCalledWith(150);
+        expect(startImportRunMock).toHaveBeenCalledWith(150, false);
     });
 
     it('uses the given limit when it is a valid positive number', async () => {
         const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50 });
 
         expect(res.status).toBe(202);
-        expect(startImportRunMock).toHaveBeenCalledWith(50);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, false);
     });
 
     // IMP1-01: the in-memory `importRunState.running` check above can
@@ -112,13 +119,40 @@ describe('POST /admin/import/run', () => {
     // as the actual (post-clamp) limit, since the clamp against
     // MAX_IMPORT_LIMIT lives in the service, not here.
     it('echoes back the clamped limit from startImportRun, not the requested one', async () => {
-        startImportRunMock.mockResolvedValue({ started: true, limit: 500 });
+        startImportRunMock.mockResolvedValue({ started: true, limit: 500, dryRun: false });
 
         const res = await request(buildApp()).post('/admin/import/run').send({ limit: 5000 });
 
         expect(res.status).toBe(202);
         expect(res.body.limit).toBe(500);
-        expect(startImportRunMock).toHaveBeenCalledWith(5000);
+        expect(startImportRunMock).toHaveBeenCalledWith(5000, false);
+    });
+
+    // IMP2-03
+    it('forwards dryRun: true to startImportRun and echoes it back', async () => {
+        const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50, dryRun: true });
+
+        expect(res.status).toBe(202);
+        expect(res.body.dryRun).toBe(true);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, true);
+    });
+
+    it('coerces a non-boolean dryRun (e.g. the string "false") to a real boolean rather than passing it through raw', async () => {
+        const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50, dryRun: 'false' });
+
+        // 'false' is a non-empty string -- truthy in JS -- so Boolean(...)
+        // deliberately does NOT treat it as false. This asserts the route
+        // is actually calling Boolean() and not just forwarding req.body
+        // .dryRun untouched, which would also happen to pass a naive
+        // `=== true` check.
+        expect(startImportRunMock).toHaveBeenCalledWith(50, true);
+    });
+
+    it('defaults dryRun to false when omitted', async () => {
+        const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50 });
+
+        expect(res.body.dryRun).toBe(false);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, false);
     });
 });
 
@@ -172,7 +206,7 @@ describe('GET /admin/import/status', () => {
 
     it('falls back to the most recent import_runs row when nothing is live', async () => {
         queue('import_runs', {
-            data: [{ status: 'interrupted', started_at: '2026-01-01', finished_at: null, exit_code: null, log: 'a\nb', error_message: 'restarted' }],
+            data: [{ status: 'interrupted', started_at: '2026-01-01', finished_at: null, exit_code: null, log: 'a\nb', error_message: 'restarted', dry_run: false }],
             error: null,
         });
 
@@ -189,13 +223,15 @@ describe('GET /admin/import/status', () => {
         // IMP2-01: this row wasn't cancelled, just interrupted -- the two
         // are distinct outcomes and shouldn't be conflated.
         expect(res.body.cancelled).toBe(false);
+        // IMP2-03
+        expect(res.body.dryRun).toBe(false);
     });
 
     // IMP2-01: mirrors the 'interrupted' fallback case just above, but
     // for a row an admin actually stopped via POST /admin/import/stop.
     it("reports cancelled: true from the DB fallback when the last row's status is 'cancelled'", async () => {
         queue('import_runs', {
-            data: [{ status: 'cancelled', started_at: '2026-01-01', finished_at: '2026-01-01', exit_code: null, log: 'a', error_message: null }],
+            data: [{ status: 'cancelled', started_at: '2026-01-01', finished_at: '2026-01-01', exit_code: null, log: 'a', error_message: null, dry_run: false }],
             error: null,
         });
 
@@ -204,6 +240,22 @@ describe('GET /admin/import/status', () => {
         expect(res.status).toBe(200);
         expect(res.body.cancelled).toBe(true);
         expect(res.body.interrupted).toBe(false);
+    });
+
+    // IMP2-03: mirrors the 'interrupted'/'cancelled' fallback cases above,
+    // but for dryRun -- persisted directly on the row rather than
+    // inferred from status, since a dry run can succeed/error/etc. just
+    // like a real one.
+    it('reports dryRun: true from the DB fallback when the last row was a dry run', async () => {
+        queue('import_runs', {
+            data: [{ status: 'success', started_at: '2026-01-01', finished_at: '2026-01-01', exit_code: 0, log: 'a', error_message: null, dry_run: true }],
+            error: null,
+        });
+
+        const res = await request(buildApp()).get('/admin/import/status');
+
+        expect(res.status).toBe(200);
+        expect(res.body.dryRun).toBe(true);
     });
 
     // IMP1-04: importRunState.persisted is just another field on the
@@ -233,6 +285,18 @@ describe('GET /admin/import/status', () => {
 
         expect(res.status).toBe(200);
         expect(res.body.cancelled).toBe(true);
+    });
+
+    // IMP2-03: same idea as persisted/cancelled above -- importRunState.
+    // dryRun flows through the live branch's spread untouched.
+    it('surfaces dryRun: true from live in-memory state for a run started with the dry-run flag', async () => {
+        importRunStateMock.running = true;
+        importRunStateMock.dryRun = true;
+
+        const res = await request(buildApp()).get('/admin/import/status');
+
+        expect(res.status).toBe(200);
+        expect(res.body.dryRun).toBe(true);
     });
 
     it('falls back to the in-memory state when the import_runs table has no rows', async () => {

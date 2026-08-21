@@ -1,0 +1,16 @@
+-- Run this once in the Supabase SQL editor before deploying the IMP2-03
+-- fix -- POST /admin/import/run now accepts a `dryRun` boolean and
+-- persists it alongside the row it already writes for every run, and
+-- GET /admin/import/status's DB-fallback branch selects this column.
+--
+-- discover-series-by-keyword.ts has supported a --dry-run flag (skips the
+-- actual candidate insert, just logs what it would have queued) since
+-- before this table existed, but there was previously no way to trigger
+-- it from the admin UI or the /run route -- only by running the script
+-- from the command line. Without a persisted flag, a dry run's row in
+-- import_runs would be indistinguishable from a real one after the fact
+-- (e.g. once IMP3-03's run history exists), which matters here
+-- specifically because a dry run is expected to complete "successfully"
+-- while queuing nothing -- worth being able to tell apart from a real
+-- run that also happened to queue nothing.
+alter table import_runs add column if not exists dry_run boolean not null default false;

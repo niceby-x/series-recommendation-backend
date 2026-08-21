@@ -27,19 +27,25 @@ router.post('/run', async (req: Request, res: Response) => {
 
     const limitInput = parseInt(req.body?.limit);
     const requestedLimit = Number.isFinite(limitInput) && limitInput > 0 ? limitInput : DEFAULT_IMPORT_LIMIT;
+    // IMP2-03: Boolean(...) rather than a truthy check on the raw value --
+    // req.body?.dryRun could arrive as the string "false" from some
+    // clients (e.g. a plain HTML form field), which is truthy in JS but
+    // means false here. Booleans on a JSON body (the only kind this route
+    // actually expects) pass through Boolean() unchanged either way.
+    const dryRun = Boolean(req.body?.dryRun);
 
     // IMP1-03: the actual clamp against MAX_IMPORT_LIMIT happens inside
     // startImportRun (single source of truth for every caller, including
     // a future scheduler) -- result.limit is the post-clamp value, echoed
     // back here so the admin sees what actually ran, not just what they
     // requested.
-    const result = await startImportRun(requestedLimit);
+    const result = await startImportRun(requestedLimit, dryRun);
 
     if (!result.started) {
         return res.status(409).json({ message: 'An import is already running.' });
     }
 
-    res.status(202).json({ message: 'Import started', limit: result.limit });
+    res.status(202).json({ message: 'Import started', limit: result.limit, dryRun: result.dryRun });
 });
 
 // IMP2-01 - Stop the currently-running import (admin only). importChild
@@ -98,7 +104,7 @@ router.get('/status', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
         .from('import_runs')
-        .select('status, limit_per_type, started_at, finished_at, exit_code, log, error_message')
+        .select('status, limit_per_type, started_at, finished_at, exit_code, log, error_message, dry_run')
         .order('started_at', { ascending: false })
         .limit(1);
 
@@ -128,6 +134,11 @@ router.get('/status', async (req: Request, res: Response) => {
         // so this branch can tell it apart from a normal success/error
         // finish the same way it already does for 'interrupted'.
         cancelled: lastRun.status === 'cancelled',
+        // IMP2-03: mirrors the live branch's importRunState.dryRun --
+        // persisted directly on the row (migrations/014) rather than
+        // inferred from status, since a dry run can itself succeed,
+        // error, get interrupted, or get cancelled just like a real one.
+        dryRun: lastRun.dry_run,
     });
 });
 

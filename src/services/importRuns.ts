@@ -48,6 +48,13 @@ export interface ImportRunState {
     // killed child process exit with code 0, so 'success' isn't right
     // either). Reset to false at the start of every run.
     cancelled: boolean;
+    // IMP2-03: mirrors the --dry-run flag passed to
+    // discover-series-by-keyword.ts for this run -- the script skips its
+    // actual candidate insert in that mode, just logs what it would have
+    // queued, so this is what lets the admin UI (and, later, IMP3-03's
+    // run history) tell a dry run apart from a real one that happened to
+    // queue nothing. Reset to false at the start of every run.
+    dryRun: boolean;
 }
 
 const MAX_IMPORT_LOG_LINES = 300;
@@ -79,6 +86,7 @@ export const importRunState: ImportRunState = {
     error: null,
     persisted: true,
     cancelled: false,
+    dryRun: false,
 };
 
 let importChild: ChildProcess | null = null;
@@ -155,9 +163,16 @@ export async function reconcileOrphanedImportRun() {
 // insert below (a different process/instance, or a restart that cleared
 // this process's in-memory state without clearing the DB row). Either
 // way, no child process gets spawned on top of one that's already going.
+//
+// IMP2-03: dryRun is forwarded straight through to the script as
+// --dry-run (see its DRY_RUN = process.argv.includes('--dry-run') check)
+// -- the script itself already knows how to skip its candidate insert in
+// that mode; this just plumbs a way to ask for it through here instead
+// of only from the command line.
 export async function startImportRun(
-    limit: number
-): Promise<{ started: boolean; conflict?: boolean; limit?: number }> {
+    limit: number,
+    dryRun: boolean = false
+): Promise<{ started: boolean; conflict?: boolean; limit?: number; dryRun?: boolean }> {
     // First line of defense: cheap, no DB round trip, and closes the
     // specific TOCTOU window IMP1-01 was filed for -- the route handler's
     // own `if (importRunState.running)` check happens right after
@@ -189,9 +204,8 @@ export async function startImportRun(
         runningCompiled ? 'discover-series-by-keyword.js' : 'discover-series-by-keyword.ts'
     );
     const command = process.platform === 'win32' ? 'node.exe' : 'node';
-    const args = runningCompiled
-        ? [scriptPath, '--limit=' + clampedLimit]
-        : ['--import', 'tsx', scriptPath, '--limit=' + clampedLimit];
+    const scriptArgs = ['--limit=' + clampedLimit, ...(dryRun ? ['--dry-run'] : [])];
+    const args = runningCompiled ? [scriptPath, ...scriptArgs] : ['--import', 'tsx', scriptPath, ...scriptArgs];
 
     importRunState.running = true;
     importRunState.startedAt = new Date().toISOString();
@@ -202,10 +216,16 @@ export async function startImportRun(
     importRunState.error = null;
     importRunState.persisted = true;
     importRunState.cancelled = false;
+    importRunState.dryRun = dryRun;
 
     const { data: runRow, error: insertError } = await supabase
         .from('import_runs')
-        .insert({ status: 'running', limit_per_type: clampedLimit, started_at: importRunState.startedAt })
+        .insert({
+            status: 'running',
+            limit_per_type: clampedLimit,
+            started_at: importRunState.startedAt,
+            dry_run: dryRun,
+        })
         .select('id')
         .single();
 
@@ -299,7 +319,7 @@ export async function startImportRun(
         }
     });
 
-    return { started: true, limit: clampedLimit };
+    return { started: true, limit: clampedLimit, dryRun };
 }
 
 // IMP2-01: importChild was already tracked module-scope for the
