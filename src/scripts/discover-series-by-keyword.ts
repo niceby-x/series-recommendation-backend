@@ -26,6 +26,46 @@ const MAX_PAGES = 50;
 // so a single run stays reviewable. Override with --limit=300 on the command line.
 const DEFAULT_LIMIT = 150;
 
+// IMP3-04: discoverPage() and getDetails() previously just checked res.ok
+// and logged-and-skipped on any failure, so a TMDB 429 mid-run silently
+// dropped whatever page/detail it hit -- indistinguishable in the log from
+// "no more results" or a real error. This retries 429s with backoff before
+// giving up, and the final skip log (below) says explicitly that it's a
+// rate-limit skip, not a "ran out of results" skip.
+const MAX_429_RETRIES = 3;
+const BASE_BACKOFF_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Wraps fetch with retry-with-backoff for TMDB 429s only -- any other
+// status (including other errors) is returned as-is on the first try,
+// same as before, since only rate limiting is transient in a way retrying
+// helps with. Honors TMDB's Retry-After header when present, otherwise
+// falls back to exponential backoff (1s, 2s, 4s).
+async function fetchWithRetry(url: string, context: string): Promise<Response> {
+    let attempt = 0;
+
+    while (true) {
+        const res = await fetch(url, { headers: TMDB_HEADERS });
+
+        if (res.status !== 429 || attempt >= MAX_429_RETRIES) {
+            return res;
+        }
+
+        attempt++;
+        const retryAfterHeader = res.headers.get('retry-after');
+        const retryAfterSeconds = retryAfterHeader ? parseInt(retryAfterHeader, 10) : NaN;
+        const backoffMs = !Number.isNaN(retryAfterSeconds)
+            ? retryAfterSeconds * 1000
+            : BASE_BACKOFF_MS * Math.pow(2, attempt - 1);
+
+        console.error('  ' + context + ' hit TMDB 429 — retrying in ' + backoffMs + 'ms (attempt ' + attempt + '/' + MAX_429_RETRIES + ')');
+        await sleep(backoffMs);
+    }
+}
+
 const DRY_RUN = process.argv.includes('--dry-run');
 
 // IMP3-02: was previously the only keyword this script could ever search
@@ -133,10 +173,14 @@ async function discoverPage(keywordId: number, mediaType: MediaType, page: numbe
         + '&sort_by=popularity.desc'
         + '&page=' + page;
 
-    const res = await fetch(url, { headers: TMDB_HEADERS });
+    const res = await fetchWithRetry(url, 'Discover request page ' + page + ' (' + mediaType + ')');
 
     if (!res.ok) {
-        console.error('  Discover request failed on page ' + page + ' (' + mediaType + '): ' + res.status);
+        if (res.status === 429) {
+            console.error('  Discover request failed on page ' + page + ' (' + mediaType + '): still rate-limited (429) after ' + MAX_429_RETRIES + ' retries — page skipped, not "no more results"');
+        } else {
+            console.error('  Discover request failed on page ' + page + ' (' + mediaType + '): ' + res.status);
+        }
         return [];
     }
 
@@ -178,9 +222,14 @@ async function getDetails(tmdbId: number, mediaType: MediaType): Promise<Normali
     const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
     const url = 'https://api.themoviedb.org/3/' + endpoint + '/' + tmdbId + '?append_to_response=credits';
 
-    const res = await fetch(url, { headers: TMDB_HEADERS });
+    const res = await fetchWithRetry(url, 'Details lookup for TMDB id ' + tmdbId + ' (' + mediaType + ')');
 
     if (!res.ok) {
+        if (res.status === 429) {
+            console.error('  Details lookup failed for TMDB id ' + tmdbId + ' (' + mediaType + '): still rate-limited (429) after ' + MAX_429_RETRIES + ' retries — skipped');
+        } else {
+            console.error('  Details lookup failed for TMDB id ' + tmdbId + ' (' + mediaType + '): ' + res.status);
+        }
         return null;
     }
 
