@@ -48,6 +48,22 @@ const updateMock = vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null })
 // persisted for the initial row (e.g. IMP2-03's dry_run), not just that
 // spawn() eventually got called.
 let insertMock: ReturnType<typeof vi.fn>;
+// IMP1-05: stubs the self-heal check's read
+// (select('id, started_at').eq(...).order(...).limit(...)) -- defaults to
+// "no stuck row found" via queueInsertResult below, so every existing
+// conflict-handling test is unaffected unless it opts in with
+// queueSelectResult.
+let selectMock: ReturnType<typeof vi.fn>;
+
+function queueSelectResult(result: { data: any; error?: any }) {
+    selectMock = vi.fn(() => ({
+        eq: vi.fn(() => ({
+            order: vi.fn(() => ({
+                limit: vi.fn().mockResolvedValue(result),
+            })),
+        })),
+    }));
+}
 
 import { importRunState, startImportRun, stopImportRun, MAX_IMPORT_LIMIT, DEFAULT_KEYWORD } from '../importRuns';
 
@@ -63,16 +79,34 @@ function makeFakeChild() {
     return child;
 }
 
-function queueInsertResult(result: { data: any; error: any }) {
+function queueInsertResult(...results: { data: any; error: any }[]) {
+    // IMP1-05: the self-heal path can call .insert() a second time in the
+    // same startImportRun() call (once the stuck row is cleared) -- a
+    // queue lets a test hand back a different result per call instead of
+    // always the same one. Single-result callers (every pre-existing
+    // test) are unaffected: the last (only) queued result just keeps
+    // being returned once the queue is drained.
+    const queue = [...results];
     insertMock = vi.fn(() => ({
         select: vi.fn(() => ({
-            single: vi.fn().mockResolvedValue(result),
+            single: vi.fn().mockImplementation(() =>
+                Promise.resolve(queue.length > 1 ? queue.shift()! : queue[0])
+            ),
         })),
     }));
+    // IMP1-05: default -- no stuck row found -- overridable per-test via
+    // queueSelectResult() called after this.
+    queueSelectResult({ data: [], error: null });
     fromMock.mockImplementation((table: string) => {
         if (table === 'import_runs') {
             return {
                 insert: insertMock,
+                // IMP1-05: the self-heal check inside the 23505 branch
+                // reads through here. Wrapped in a closure (not a direct
+                // reference) so a later queueSelectResult() call in the
+                // same test still takes effect -- fromMock itself isn't
+                // re-created when only selectMock is reassigned.
+                select: (...args: any[]) => selectMock(...args),
                 // The 'close'/'error' handlers fire an un-awaited .update()
                 // once the fake child emits close() -- stub it as a
                 // thenable no-op so those fire-and-forget calls don't
@@ -190,6 +224,53 @@ describe('startImportRun', () => {
         fakeChild.emit('close', 0);
     });
 
+    // IMP1-05
+    it('self-heals: clears a stuck running row past the threshold and retries the insert', async () => {
+        const conflict = {
+            data: null,
+            error: { code: '23505', message: 'duplicate key value violates unique constraint "import_runs_one_running_idx"' },
+        };
+        queueInsertResult(conflict, { data: { id: 99 }, error: null });
+        queueSelectResult({
+            data: [{ id: 7, started_at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString() }], // 3h old
+            error: null,
+        });
+        const fakeChild = makeFakeChild();
+        spawnMock.mockReturnValue(fakeChild);
+
+        const result = await startImportRun(100);
+
+        // The stuck row (id 7) got marked interrupted before the retried
+        // insert, and the run proceeds normally on top of the new row.
+        expect(updateMock).toHaveBeenCalledWith(expect.objectContaining({ status: 'interrupted' }));
+        expect(insertMock).toHaveBeenCalledTimes(2);
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false, keyword: DEFAULT_KEYWORD });
+        expect(spawnMock).toHaveBeenCalledTimes(1);
+
+        fakeChild.emit('close', 0);
+    });
+
+    // IMP1-05
+    it('does not touch a running row that is recent -- still returns conflict, no self-heal', async () => {
+        const conflict = {
+            data: null,
+            error: { code: '23505', message: 'duplicate key value violates unique constraint "import_runs_one_running_idx"' },
+        };
+        queueInsertResult(conflict);
+        queueSelectResult({
+            data: [{ id: 7, started_at: new Date(Date.now() - 5 * 60 * 1000).toISOString() }], // 5m old
+            error: null,
+        });
+
+        const result = await startImportRun(100);
+
+        expect(result).toEqual({ started: false, conflict: true });
+        expect(spawnMock).not.toHaveBeenCalled();
+        // A genuinely in-progress run's row must never be touched.
+        expect(updateMock).not.toHaveBeenCalled();
+        expect(insertMock).toHaveBeenCalledTimes(1);
+    });
+
     // IMP1-03: defensive lower bound -- nothing currently in the route
     // calls startImportRun with a non-positive limit (it defaults to
     // DEFAULT_IMPORT_LIMIT before calling), but this is the single
@@ -244,6 +325,39 @@ describe('startImportRun with dryRun', () => {
         expect(spawnArgs).not.toContain('--dry-run');
 
         fakeChild.emit('close', 0);
+    });
+});
+
+describe('close/error handler persistence (IMP1-05)', () => {
+    it('retries the completion write on failure and succeeds on a later attempt, instead of silently dropping it', async () => {
+        vi.useFakeTimers();
+        try {
+            queueInsertResult({ data: { id: 42 }, error: null });
+            const fakeChild = makeFakeChild();
+            spawnMock.mockReturnValue(fakeChild);
+            await startImportRun(100);
+
+            // First two attempts fail (simulating the transient Supabase
+            // hiccup from the bug report), third succeeds.
+            let call = 0;
+            updateMock.mockImplementation(() => ({
+                eq: vi.fn().mockImplementation(() =>
+                    Promise.resolve(++call < 3 ? { error: { message: 'transient network error' } } : { error: null })
+                ),
+            }));
+
+            fakeChild.emit('close', 0);
+            // Let the retry loop's backoff timers run to completion.
+            await vi.runAllTimersAsync();
+
+            // Previously this write was fire-and-forget with zero retries
+            // -- it would have been called once and, on failure, left the
+            // row stuck at 'running' forever. Now it keeps trying until it
+            // succeeds (or exhausts UPDATE_RETRY_ATTEMPTS).
+            expect(call).toBe(3);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 

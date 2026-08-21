@@ -111,6 +111,24 @@ export const DEFAULT_KEYWORD = "boys' love (bl)";
 // someone pasting in something absurd.
 export const MAX_KEYWORD_LENGTH = 100;
 
+// IMP1-05: the close/error handlers' import_runs update used to be
+// fire-and-forgotten with no retry or error handling -- a transient
+// Supabase hiccup at exactly the wrong moment silently left the row stuck
+// at status: 'running' forever, which then permanently blocked every
+// future run via the import_runs_one_running_idx unique index (IMP1-01).
+// UPDATE_RETRY_ATTEMPTS/UPDATE_RETRY_BASE_DELAY_MS bound the short-term
+// retry in updateImportRunWithRetry below. STUCK_RUN_THRESHOLD_MS backs
+// that up as a longer-horizon safety net in startImportRun's conflict
+// handling, for the rarer case where the retries above also all fail
+// (e.g. a Supabase outage spanning the whole close handler) -- no real
+// discovery run should take anywhere near this long (the script's own
+// hard ceiling is 50 pages x 20 results x 2 media types), so a 'running'
+// row older than this can only be a stuck one, never a legitimately
+// in-progress run.
+const UPDATE_RETRY_ATTEMPTS = 3;
+const UPDATE_RETRY_BASE_DELAY_MS = 500;
+const STUCK_RUN_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
+
 export const importRunState: ImportRunState = {
     running: false,
     startedAt: null,
@@ -171,6 +189,46 @@ async function persistImportLog() {
         .from('import_runs')
         .update({ log: importRunState.logTail.join('\n') })
         .eq('id', importRunDbId);
+}
+
+function sleep(ms: number) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// IMP1-05: retries a best-effort import_runs update a few times with
+// backoff before giving up -- used by the close/error handlers below so a
+// single transient Supabase blip doesn't leave a row stuck at
+// status: 'running' forever (see UPDATE_RETRY_ATTEMPTS's comment). Callers
+// still don't block on this in any way that matters -- the handlers fire
+// it and move on -- this only bounds how long the retry loop itself keeps
+// trying before it logs and gives up. Doesn't touch the existing
+// in-memory-first read path in GET /status; that race (documented there)
+// is unchanged, just now bounded on the write side instead of unbounded.
+async function updateImportRunWithRetry(id: number, patch: Record<string, unknown>): Promise<boolean> {
+    for (let attempt = 1; attempt <= UPDATE_RETRY_ATTEMPTS; attempt++) {
+        const { error } = await supabase.from('import_runs').update(patch).eq('id', id);
+        if (!error) return true;
+
+        console.error(
+            `[import] Failed to persist import_runs row ${id} (attempt ${attempt}/${UPDATE_RETRY_ATTEMPTS}): ${error.message}`
+        );
+        if (attempt < UPDATE_RETRY_ATTEMPTS) {
+            await sleep(UPDATE_RETRY_BASE_DELAY_MS * attempt);
+        }
+    }
+
+    // All retries exhausted -- the row stays at whatever it was last
+    // successfully written as (almost always still 'running', since this
+    // only ever guards the completion/error writes). It isn't permanently
+    // stuck even so: the next /run attempt's self-heal check in
+    // startImportRun below will clear it out once STUCK_RUN_THRESHOLD_MS
+    // has passed, and reconcileOrphanedImportRun() would also catch it on
+    // the next boot in the meantime. Logged loudly here so it's visible in
+    // server logs rather than only ever inferred later from a 409.
+    console.error(
+        `[import] Giving up on persisting import_runs row ${id} after ${UPDATE_RETRY_ATTEMPTS} attempts -- it may be picked up by the next run's stuck-row check or the next server restart.`
+    );
+    return false;
 }
 
 // Runs once at server boot. If the last row in `import_runs` is still
@@ -301,17 +359,60 @@ export async function startImportRun(
     importRunState.summary = null;
     importRunState.keyword = effectiveKeyword;
 
-    const { data: runRow, error: insertError } = await supabase
-        .from('import_runs')
-        .insert({
-            status: 'running',
-            limit_per_type: clampedLimit,
-            started_at: importRunState.startedAt,
-            dry_run: dryRun,
-            keyword: effectiveKeyword,
-        })
-        .select('id')
-        .single();
+    const insertPayload = {
+        status: 'running',
+        limit_per_type: clampedLimit,
+        started_at: importRunState.startedAt,
+        dry_run: dryRun,
+        keyword: effectiveKeyword,
+    };
+
+    // IMP1-05: normally this insert either succeeds outright or hits a
+    // genuine 23505 conflict (a real run actually in progress), handled
+    // exactly as before below. The one new case: the existing 'running'
+    // row is itself stuck (its owning process's close/error handler
+    // exhausted every retry in updateImportRunWithRetry, or died before
+    // either handler ever ran) -- previously that meant every future
+    // /run 409'd forever with nothing actually running. healedOnce caps
+    // this at a single auto-clear attempt per call, so a genuinely busy
+    // importer (a real conflict) still just returns conflict: true below
+    // as before, and this can't loop.
+    let healedOnce = false;
+    let runRow: { id: number } | null = null;
+    let insertError: any = null;
+
+    while (true) {
+        const result = await supabase.from('import_runs').insert(insertPayload).select('id').single();
+        runRow = result.data as { id: number } | null;
+        insertError = result.error;
+
+        if (insertError?.code !== '23505' || healedOnce) break;
+        healedOnce = true;
+
+        const { data: stuckRows } = await supabase
+            .from('import_runs')
+            .select('id, started_at')
+            .eq('status', 'running')
+            .order('started_at', { ascending: false })
+            .limit(1);
+
+        const stuck = stuckRows?.[0];
+        const stuckAgeMs = stuck ? Date.now() - new Date(stuck.started_at).getTime() : 0;
+
+        // Not actually stuck (or we couldn't even read it) -- leave it
+        // alone and fall through to the normal conflict handling below.
+        // This is the branch a real, currently-in-progress run takes.
+        if (!stuck || stuckAgeMs <= STUCK_RUN_THRESHOLD_MS) break;
+
+        await updateImportRunWithRetry(stuck.id, {
+            status: 'interrupted',
+            finished_at: new Date().toISOString(),
+            error_message:
+                'Auto-cleared: row was stuck at running longer than any real import could take (likely a failed completion write).',
+        });
+        // Loop back around and retry the insert now that the stuck row's
+        // slot in the unique index is free.
+    }
 
     // 23505 = unique_violation -- import_runs_one_running_idx
     // (migrations/013_import_runs_running_unique.sql) rejected this insert
@@ -338,7 +439,7 @@ export async function startImportRun(
     // import), but importRunState.persisted flips to false so the route
     // can surface it and the admin isn't left thinking the run's outcome
     // is being recorded when it isn't.
-    importRunDbId = insertError ? null : runRow.id;
+    importRunDbId = insertError || !runRow ? null : runRow.id;
     importRunState.persisted = importRunDbId !== null;
 
     // Throttled rather than per-chunk -- a per-line DB write would fire
@@ -364,15 +465,14 @@ export async function startImportRun(
 
         if (importLogFlushTimer) clearInterval(importLogFlushTimer);
         if (importRunDbId !== null) {
-            supabase
-                .from('import_runs')
-                .update({
-                    status: 'error',
-                    finished_at: importRunState.finishedAt,
-                    error_message: err.message,
-                    log: importRunState.logTail.join('\n'),
-                })
-                .eq('id', importRunDbId);
+            // IMP1-05: was a bare, un-awaited supabase call with no error
+            // handling -- see updateImportRunWithRetry's comment.
+            void updateImportRunWithRetry(importRunDbId, {
+                status: 'error',
+                finished_at: importRunState.finishedAt,
+                error_message: err.message,
+                log: importRunState.logTail.join('\n'),
+            });
         }
     });
 
@@ -384,32 +484,33 @@ export async function startImportRun(
 
         if (importLogFlushTimer) clearInterval(importLogFlushTimer);
         if (importRunDbId !== null) {
-            supabase
-                .from('import_runs')
-                .update({
-                    // IMP2-01: a run stopped via stopImportRun() exits
-                    // with a signal, not a normal exit code -- `code` is
-                    // null in that case (Node reports the death via the
-                    // separate `signal` param this handler doesn't take),
-                    // which would otherwise fall into the 'error' bucket
-                    // and misreport a deliberate admin action as a
-                    // failure. importRunState.cancelled disambiguates it.
-                    status: importRunState.cancelled ? 'cancelled' : code === 0 ? 'success' : 'error',
-                    finished_at: importRunState.finishedAt,
-                    exit_code: code,
-                    log: importRunState.logTail.join('\n'),
-                    // IMP3-01: importRunState.summary is only ever set by
-                    // the script's final __IMPORT_SUMMARY__ stdout line,
-                    // which (barring a truncated chunk -- see
-                    // appendImportLog) has already landed by the time
-                    // 'close' fires, since Node only emits 'close' once
-                    // the child's stdio streams are fully drained. Stays
-                    // null here for a run that errored, was stopped, or
-                    // got interrupted before reaching that line -- same
-                    // as it already is in memory, nothing to invent.
-                    summary: importRunState.summary,
-                })
-                .eq('id', importRunDbId);
+            // IMP1-05: was a bare, un-awaited supabase call with no error
+            // handling -- see updateImportRunWithRetry's comment. This is
+            // the write that used to silently fail and leave the row
+            // stuck at status: 'running' forever.
+            void updateImportRunWithRetry(importRunDbId, {
+                // IMP2-01: a run stopped via stopImportRun() exits
+                // with a signal, not a normal exit code -- `code` is
+                // null in that case (Node reports the death via the
+                // separate `signal` param this handler doesn't take),
+                // which would otherwise fall into the 'error' bucket
+                // and misreport a deliberate admin action as a
+                // failure. importRunState.cancelled disambiguates it.
+                status: importRunState.cancelled ? 'cancelled' : code === 0 ? 'success' : 'error',
+                finished_at: importRunState.finishedAt,
+                exit_code: code,
+                log: importRunState.logTail.join('\n'),
+                // IMP3-01: importRunState.summary is only ever set by
+                // the script's final __IMPORT_SUMMARY__ stdout line,
+                // which (barring a truncated chunk -- see
+                // appendImportLog) has already landed by the time
+                // 'close' fires, since Node only emits 'close' once
+                // the child's stdio streams are fully drained. Stays
+                // null here for a run that errored, was stopped, or
+                // got interrupted before reaching that line -- same
+                // as it already is in memory, nothing to invent.
+                summary: importRunState.summary,
+            });
         }
     });
 
