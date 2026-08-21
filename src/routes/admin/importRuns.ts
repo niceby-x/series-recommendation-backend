@@ -34,18 +34,25 @@ router.post('/run', async (req: Request, res: Response) => {
     // actually expects) pass through Boolean() unchanged either way.
     const dryRun = Boolean(req.body?.dryRun);
 
+    // IMP3-02: only forwards a string body value through -- anything else
+    // (missing, null, a number, etc.) is left undefined so
+    // startImportRun's own trim/default/clamp (single source of truth,
+    // same reasoning as IMP1-03's limit clamp) falls back to
+    // DEFAULT_KEYWORD instead of this route trying to validate it twice.
+    const keywordInput = typeof req.body?.keyword === 'string' ? req.body.keyword : undefined;
+
     // IMP1-03: the actual clamp against MAX_IMPORT_LIMIT happens inside
     // startImportRun (single source of truth for every caller, including
     // a future scheduler) -- result.limit is the post-clamp value, echoed
     // back here so the admin sees what actually ran, not just what they
     // requested.
-    const result = await startImportRun(requestedLimit, dryRun);
+    const result = await startImportRun(requestedLimit, dryRun, keywordInput);
 
     if (!result.started) {
         return res.status(409).json({ message: 'An import is already running.' });
     }
 
-    res.status(202).json({ message: 'Import started', limit: result.limit, dryRun: result.dryRun });
+    res.status(202).json({ message: 'Import started', limit: result.limit, dryRun: result.dryRun, keyword: result.keyword });
 });
 
 // IMP2-01 - Stop the currently-running import (admin only). importChild
@@ -104,7 +111,7 @@ router.get('/status', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
         .from('import_runs')
-        .select('status, limit_per_type, started_at, finished_at, exit_code, log, error_message, dry_run, summary')
+        .select('status, limit_per_type, started_at, finished_at, exit_code, log, error_message, dry_run, summary, keyword')
         .order('started_at', { ascending: false })
         .limit(1);
 
@@ -144,6 +151,12 @@ router.get('/status', async (req: Request, res: Response) => {
         // errored/was stopped/got interrupted before the script reached
         // its final __IMPORT_SUMMARY__ line, same as the live branch.
         summary: lastRun.summary,
+        // IMP3-02: mirrors the live branch's importRunState.keyword --
+        // persisted directly on the row (migrations/016), defaulted at
+        // the DB level to the same keyword every pre-migration row was
+        // actually searched for, so this is never null/empty for a real
+        // row, live or historical.
+        keyword: lastRun.keyword,
     });
 });
 

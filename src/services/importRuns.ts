@@ -63,6 +63,13 @@ export interface ImportRunState {
     // the script already computed for its own human-readable log; this is
     // just the structured version of the same numbers.
     summary: ImportRunSummary | null;
+    // IMP3-02: the effective (post-trim/default/clamp) keyword this run
+    // was/is searching TMDB for -- previously always the hardcoded
+    // "boys' love (bl)" default, now whatever startImportRun resolved
+    // (see DEFAULT_KEYWORD/MAX_KEYWORD_LENGTH below), forwarded to the
+    // script as --keyword=. null only before this process has ever seen a
+    // run start.
+    keyword: string | null;
 }
 
 export interface ImportRunSummary {
@@ -90,6 +97,20 @@ const LOG_PERSIST_INTERVAL_MS = 5000;
 export const DEFAULT_IMPORT_LIMIT = 150;
 export const MAX_IMPORT_LIMIT = 500;
 
+// IMP3-02: mirrors discover-series-by-keyword.ts's own DEFAULT_KEYWORD
+// constant -- kept as a separate copy rather than imported, the same way
+// DEFAULT_IMPORT_LIMIT above duplicates the script's DEFAULT_LIMIT rather
+// than sharing it, since the script runs as its own spawned process
+// (see startImportRun below), not as an imported module. If the script's
+// default ever changes, this needs updating to match.
+export const DEFAULT_KEYWORD = "boys' love (bl)";
+// Sanity cap on the keyword input's length -- an admin-controlled text
+// field with no upper bound is the same class of problem IMP1-03 fixed
+// for the limit input, just for a string instead of a number. 100 is
+// generous for any real TMDB keyword/genre phrase while still ruling out
+// someone pasting in something absurd.
+export const MAX_KEYWORD_LENGTH = 100;
+
 export const importRunState: ImportRunState = {
     running: false,
     startedAt: null,
@@ -102,6 +123,7 @@ export const importRunState: ImportRunState = {
     cancelled: false,
     dryRun: false,
     summary: null,
+    keyword: null,
 };
 
 let importChild: ChildProcess | null = null;
@@ -211,10 +233,17 @@ export async function reconcileOrphanedImportRun() {
 // -- the script itself already knows how to skip its candidate insert in
 // that mode; this just plumbs a way to ask for it through here instead
 // of only from the command line.
+//
+// IMP3-02: keyword is trimmed/defaulted/length-clamped here -- same
+// "single source of truth for every caller" reasoning as IMP1-03's limit
+// clamp above -- then forwarded to the script as --keyword=, which the
+// script's own parseKeywordArg reads the same way it already reads
+// --limit=.
 export async function startImportRun(
     limit: number,
-    dryRun: boolean = false
-): Promise<{ started: boolean; conflict?: boolean; limit?: number; dryRun?: boolean }> {
+    dryRun: boolean = false,
+    keyword?: string
+): Promise<{ started: boolean; conflict?: boolean; limit?: number; dryRun?: boolean; keyword?: string }> {
     // First line of defense: cheap, no DB round trip, and closes the
     // specific TOCTOU window IMP1-01 was filed for -- the route handler's
     // own `if (importRunState.running)` check happens right after
@@ -238,6 +267,16 @@ export async function startImportRun(
     // defensively, in case a future caller passes something <= 0.
     const clampedLimit = Math.max(1, Math.min(limit, MAX_IMPORT_LIMIT));
 
+    // IMP3-02: same reasoning as clampedLimit above -- trim, fall back to
+    // DEFAULT_KEYWORD on empty/whitespace-only input, and cap length so an
+    // admin can't paste in something absurd. Always resolves to a
+    // non-empty string, so the script never gets an empty --keyword= that
+    // would send a blank query to TMDB.
+    const trimmedKeyword = keyword?.trim();
+    const effectiveKeyword = trimmedKeyword && trimmedKeyword.length > 0
+        ? trimmedKeyword.slice(0, MAX_KEYWORD_LENGTH)
+        : DEFAULT_KEYWORD;
+
     const runningCompiled = __filename.endsWith('.js');
     const scriptPath = path.join(
         __dirname,
@@ -246,7 +285,7 @@ export async function startImportRun(
         runningCompiled ? 'discover-series-by-keyword.js' : 'discover-series-by-keyword.ts'
     );
     const command = process.platform === 'win32' ? 'node.exe' : 'node';
-    const scriptArgs = ['--limit=' + clampedLimit, ...(dryRun ? ['--dry-run'] : [])];
+    const scriptArgs = ['--limit=' + clampedLimit, '--keyword=' + effectiveKeyword, ...(dryRun ? ['--dry-run'] : [])];
     const args = runningCompiled ? [scriptPath, ...scriptArgs] : ['--import', 'tsx', scriptPath, ...scriptArgs];
 
     importRunState.running = true;
@@ -260,6 +299,7 @@ export async function startImportRun(
     importRunState.cancelled = false;
     importRunState.dryRun = dryRun;
     importRunState.summary = null;
+    importRunState.keyword = effectiveKeyword;
 
     const { data: runRow, error: insertError } = await supabase
         .from('import_runs')
@@ -268,6 +308,7 @@ export async function startImportRun(
             limit_per_type: clampedLimit,
             started_at: importRunState.startedAt,
             dry_run: dryRun,
+            keyword: effectiveKeyword,
         })
         .select('id')
         .single();
@@ -372,7 +413,7 @@ export async function startImportRun(
         }
     });
 
-    return { started: true, limit: clampedLimit, dryRun };
+    return { started: true, limit: clampedLimit, dryRun, keyword: effectiveKeyword };
 }
 
 // IMP2-01: importChild was already tracked module-scope for the

@@ -27,7 +27,20 @@ const MAX_PAGES = 50;
 const DEFAULT_LIMIT = 150;
 
 const DRY_RUN = process.argv.includes('--dry-run');
-let SOURCE_KEYWORD = "boys' love (bl)";
+
+// IMP3-02: was previously the only keyword this script could ever search
+// for -- now the default when --keyword isn't passed (see
+// parseKeywordArg), not the only option. Kept as a named constant rather
+// than an inline string since getKeywordId's fallback-to-known-id path
+// below only applies when running with this exact default, not an
+// arbitrary custom keyword.
+const DEFAULT_KEYWORD = "boys' love (bl)";
+// TMDB's id for DEFAULT_KEYWORD, used only as a last-resort fallback if a
+// live lookup for the default keyword comes back empty (e.g. a transient
+// TMDB API hiccup) -- there's no equivalent fallback id for a custom
+// keyword, since there's nothing to fall back to.
+const KNOWN_DEFAULT_KEYWORD_ID = 289844;
+let SOURCE_KEYWORD = DEFAULT_KEYWORD;
 
 type MediaType = 'tv' | 'movie';
 
@@ -64,11 +77,24 @@ interface NormalizedDetails {
     countryCodes: string[];
 }
 
-// Look up the TMDB keyword ID for "boys' love (bl)". Known id is 289844, but we still
-// search by name to stay resilient if TMDB ever changes ids. The same keyword id works
-// for both /discover/tv and /discover/movie, since TMDB keywords are shared across media types.
-async function getBoysLoveKeywordId(): Promise<number | null> {
-    const url = 'https://api.themoviedb.org/3/search/keyword?query=' + encodeURIComponent("boys' love");
+// Looks up the TMDB keyword id for the given query. Known-id fallback
+// and the "(bl)"-suffix matching only apply to DEFAULT_KEYWORD -- both
+// preserve this script's original behavior exactly for its built-in
+// keyword; a custom keyword has no equivalent fallback id or suffix
+// convention to rely on, so it's searched and matched verbatim, aborting
+// the run (like a failed HTTP request would) if TMDB has no match for it.
+// The same keyword id works for both /discover/tv and /discover/movie,
+// since TMDB keywords are shared across media types.
+async function getKeywordId(query: string): Promise<number | null> {
+    const isDefaultKeyword = query === DEFAULT_KEYWORD;
+    // TMDB's keyword search matches better against the bare phrase than
+    // one with a parenthetical suffix -- for the default keyword this
+    // strips "(bl)" before searching, same as this script always has,
+    // relying on the exact-match check below to pick the "(bl)" result
+    // back out of TMDB's results. A custom keyword has no such suffix
+    // convention to strip, so it's searched exactly as given.
+    const searchQuery = isDefaultKeyword ? "boys' love" : query;
+    const url = 'https://api.themoviedb.org/3/search/keyword?query=' + encodeURIComponent(searchQuery);
 
     const res = await fetch(url, { headers: TMDB_HEADERS });
 
@@ -80,11 +106,18 @@ async function getBoysLoveKeywordId(): Promise<number | null> {
     const json = await res.json();
 
     if (!json.results || json.results.length === 0) {
-        console.error('No TMDB keyword found for "boys\' love" — falling back to known id 289844');
-        return 289844;
+        if (isDefaultKeyword) {
+            console.error('No TMDB keyword found for "' + searchQuery + '" — falling back to known id ' + KNOWN_DEFAULT_KEYWORD_ID);
+            SOURCE_KEYWORD = query;
+            return KNOWN_DEFAULT_KEYWORD_ID;
+        }
+        console.error('No TMDB keyword found for "' + query + '"');
+        return null;
     }
 
-    const exactMatch = json.results.find((k: { name: string }) => k.name.toLowerCase().includes('(bl)'));
+    const exactMatch = isDefaultKeyword
+        ? json.results.find((k: { name: string }) => k.name.toLowerCase().includes('(bl)'))
+        : json.results.find((k: { name: string }) => k.name.toLowerCase() === query.toLowerCase());
     const match = exactMatch || json.results[0];
 
     console.log('Using keyword "' + match.name + '" (id ' + match.id + ')\n');
@@ -218,6 +251,20 @@ function parseLimitArg(): number {
     return isNaN(parsed) ? DEFAULT_LIMIT : parsed;
 }
 
+// IMP3-02: mirrors parseLimitArg above -- --keyword=<value> overrides the
+// built-in default. Slices off just the "--keyword=" prefix (fixed
+// length) rather than split('=')[1], since a keyword can itself contain
+// "=" in principle and split would otherwise truncate at the first one.
+// An empty/whitespace-only value (e.g. a caller passing --keyword= with
+// nothing after it) falls back to the default rather than sending an
+// empty query to TMDB.
+function parseKeywordArg(): string {
+    const arg = process.argv.find((a) => a.startsWith('--keyword='));
+    if (!arg) return DEFAULT_KEYWORD;
+    const value = arg.slice('--keyword='.length).trim();
+    return value.length > 0 ? value : DEFAULT_KEYWORD;
+}
+
 // Supabase/PostgREST caps a single unpaginated select() at 1000 rows by default.
 // series/series_candidates can easily exceed that, which was silently truncating
 // the dedupe set below and causing "Failed to queue" unique-constraint errors for
@@ -262,7 +309,10 @@ async function run() {
     const limit = parseLimitArg();
     console.log('Run limit: ' + limit + ' new candidates per media type (TV and Movies each get their own budget) — override with --limit=N\n');
 
-    const keywordId = await getBoysLoveKeywordId();
+    const keyword = parseKeywordArg();
+    console.log('Discovery keyword: "' + keyword + '" — override with --keyword=<name> (default: "' + DEFAULT_KEYWORD + '")\n');
+
+    const keywordId = await getKeywordId(keyword);
 
     if (!keywordId) {
         console.error('Could not resolve a keyword id, aborting.');
