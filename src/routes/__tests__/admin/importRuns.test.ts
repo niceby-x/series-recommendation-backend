@@ -87,14 +87,14 @@ describe('POST /admin/import/run', () => {
 
         expect(res.status).toBe(202);
         expect(res.body.limit).toBe(150);
-        expect(startImportRunMock).toHaveBeenCalledWith(150, false);
+        expect(startImportRunMock).toHaveBeenCalledWith(150, false, undefined);
     });
 
     it('uses the given limit when it is a valid positive number', async () => {
         const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50 });
 
         expect(res.status).toBe(202);
-        expect(startImportRunMock).toHaveBeenCalledWith(50, false);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, false, undefined);
     });
 
     // IMP1-01: the in-memory `importRunState.running` check above can
@@ -125,7 +125,7 @@ describe('POST /admin/import/run', () => {
 
         expect(res.status).toBe(202);
         expect(res.body.limit).toBe(500);
-        expect(startImportRunMock).toHaveBeenCalledWith(5000, false);
+        expect(startImportRunMock).toHaveBeenCalledWith(5000, false, undefined);
     });
 
     // IMP2-03
@@ -134,7 +134,7 @@ describe('POST /admin/import/run', () => {
 
         expect(res.status).toBe(202);
         expect(res.body.dryRun).toBe(true);
-        expect(startImportRunMock).toHaveBeenCalledWith(50, true);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, true, undefined);
     });
 
     it('coerces a non-boolean dryRun (e.g. the string "false") to a real boolean rather than passing it through raw', async () => {
@@ -145,14 +145,14 @@ describe('POST /admin/import/run', () => {
         // is actually calling Boolean() and not just forwarding req.body
         // .dryRun untouched, which would also happen to pass a naive
         // `=== true` check.
-        expect(startImportRunMock).toHaveBeenCalledWith(50, true);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, true, undefined);
     });
 
     it('defaults dryRun to false when omitted', async () => {
         const res = await request(buildApp()).post('/admin/import/run').send({ limit: 50 });
 
         expect(res.body.dryRun).toBe(false);
-        expect(startImportRunMock).toHaveBeenCalledWith(50, false);
+        expect(startImportRunMock).toHaveBeenCalledWith(50, false, undefined);
     });
 });
 
@@ -332,5 +332,89 @@ describe('GET /admin/import/status', () => {
         expect(res.body.running).toBe(false);
         expect(res.body.exitCode).toBe(0);
         expect(res.body.logTail).toEqual(['done']);
+    });
+});
+
+// IMP3-03: GET /admin/import/history -- the paginated audit trail behind
+// the run history tab, separate from GET /status's "current/most-recent
+// run only" view above.
+describe('GET /admin/import/history', () => {
+    it('rejects a non-admin with 403', async () => {
+        requireAdminMock.mockImplementation(rejectAdmin());
+
+        const res = await request(buildApp()).get('/admin/import/history');
+
+        expect(res.status).toBe(403);
+    });
+
+    it('returns rows newest-first with page/limit/has_more pagination', async () => {
+        queue('import_runs', {
+            data: [
+                {
+                    id: 2,
+                    status: 'success',
+                    started_at: '2026-08-20T10:00:00.000Z',
+                    finished_at: '2026-08-20T10:05:00.000Z',
+                    exit_code: 0,
+                    limit_per_type: 150,
+                    keyword: "boys' love (bl)",
+                    dry_run: false,
+                    summary: { added: 12, mediaTypeTally: { tv: 8, movie: 4 }, countryTally: { Thailand: 9 } },
+                },
+                {
+                    id: 1,
+                    status: 'error',
+                    started_at: '2026-08-19T10:00:00.000Z',
+                    finished_at: '2026-08-19T10:02:00.000Z',
+                    exit_code: 1,
+                    limit_per_type: 150,
+                    keyword: "boys' love (bl)",
+                    dry_run: false,
+                    summary: null,
+                },
+            ],
+            error: null,
+            count: 37,
+        });
+
+        const res = await request(buildApp()).get('/admin/import/history');
+
+        expect(res.status).toBe(200);
+        expect(res.body.data).toHaveLength(2);
+        expect(res.body.data[0]).toMatchObject({ id: 2, status: 'success', keyword: "boys' love (bl)" });
+        expect(res.body.data[0].summary).toEqual({ added: 12, mediaTypeTally: { tv: 8, movie: 4 }, countryTally: { Thailand: 9 } });
+        expect(res.body.data[1]).toMatchObject({ id: 1, status: 'error', summary: null });
+        expect(res.body.pagination).toEqual({ page: 1, limit: 20, total: 37, has_more: true });
+    });
+
+    it('defaults to page 1 / limit 20 and clamps limit to the 50 max', async () => {
+        queue('import_runs', { data: [], error: null, count: 0 });
+
+        const res = await request(buildApp()).get('/admin/import/history').query({ limit: 500 });
+
+        expect(res.status).toBe(200);
+        expect(res.body.pagination).toEqual({ page: 1, limit: 50, total: 0, has_more: false });
+    });
+
+    it('reports has_more: false on the last page', async () => {
+        queue('import_runs', {
+            data: [{ id: 1, status: 'success', started_at: '2026-08-19', finished_at: '2026-08-19', exit_code: 0, limit_per_type: 150, keyword: 'bl', dry_run: false, summary: null }],
+            error: null,
+            count: 21,
+        });
+
+        const res = await request(buildApp()).get('/admin/import/history').query({ page: 2, limit: 20 });
+
+        expect(res.status).toBe(200);
+        expect(res.body.pagination).toEqual({ page: 2, limit: 20, total: 21, has_more: false });
+    });
+
+    it('returns 500 with the error message when the query fails', async () => {
+        queue('import_runs', { data: null, error: { message: 'db exploded' } });
+
+        const res = await request(buildApp()).get('/admin/import/history');
+
+        expect(res.status).toBe(500);
+        expect(res.body.message).toBe('db exploded');
     });
 });

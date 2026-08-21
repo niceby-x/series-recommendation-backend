@@ -160,4 +160,65 @@ router.get('/status', async (req: Request, res: Response) => {
     });
 });
 
+// Route 18 - Paginated list of past import runs, newest first (admin
+// only) -- IMP3-03. GET /admin/import/status only ever exposes the
+// current/most-recent run; this is the audit trail for everything before
+// that, so trends and recurring failures over time are actually visible
+// rather than lost the moment a newer run starts. Same page/limit/
+// has_more pagination shape GET /collections already uses (see that
+// route's own header comment) for consistency across the admin panel's
+// paginated lists -- the frontend's history tab loads more pages on
+// demand rather than this route ever returning the whole table at once.
+router.get('/history', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    // 50 is a generous page size for a row this light (a handful of
+    // scalar fields plus one small jsonb blob) -- collections caps at 100
+    // for the same reason on a heavier joined row; this just matches the
+    // spirit, not the exact number, since a run-history table realistically
+    // never needs more than a screenful at a time regardless of page size.
+    const limit = Math.max(1, Math.min(50, parseInt(req.query.limit as string) || 20));
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    const { data, error, count } = await supabase
+        .from('import_runs')
+        .select('id, status, started_at, finished_at, exit_code, limit_per_type, keyword, dry_run, summary', {
+            count: 'exact',
+        })
+        .order('started_at', { ascending: false })
+        .range(from, to);
+
+    if (error) {
+        return res.status(500).json({ message: error.message });
+    }
+
+    const runs = (data || []).map((row: any) => ({
+        id: row.id,
+        // 'running' | 'success' | 'error' | 'interrupted' | 'cancelled' --
+        // whatever's actually in the DB, including the current run if one
+        // happens to be in progress (this is a straight read of the
+        // table, not a live in-memory view like GET /status -- that's
+        // fine here, since a still-running row just shows "Running" in
+        // the history the same way it already does in the status badge).
+        status: row.status,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at,
+        exitCode: row.exit_code,
+        limit: row.limit_per_type,
+        keyword: row.keyword,
+        dryRun: row.dry_run,
+        summary: row.summary,
+    }));
+
+    const total = count ?? runs.length;
+    res.json({
+        message: 'Import run history',
+        data: runs,
+        pagination: { page, limit, total, has_more: page * limit < total },
+    });
+});
+
 export default router;

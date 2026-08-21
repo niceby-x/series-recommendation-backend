@@ -1,0 +1,20 @@
+-- Backfilled migration log entry -- this column has been live in
+-- production since IMP3-01 shipped (src/services/importRuns.ts and
+-- src/routes/admin/importRuns.ts both already read/write `summary`), but
+-- the .sql file for it was never actually committed, breaking this
+-- folder's "one file per change" convention (see migrations/README.md).
+-- Safe to run even though the column almost certainly already exists --
+-- `add column if not exists` makes this a no-op in that case.
+--
+-- Run this before deploying anything that depends on it if you're
+-- setting up a fresh database -- GET /admin/import/status's DB-fallback
+-- branch selects this column, and the close handler in
+-- services/importRuns.ts writes to it every time a run finishes.
+--
+-- Stores the same countryTally/mediaTypeTally numbers the discovery
+-- script already computes for its own human-readable log (see
+-- SUMMARY_LOG_PREFIX / appendImportLog), as structured JSON instead of
+-- only ever existing as a stdout line -- IMP3-01's stat breakdown on the
+-- admin UI, and IMP3-03's run history, both read this column rather than
+-- re-parsing the log text.
+alter table import_runs add column if not exists summary jsonb;

@@ -49,7 +49,7 @@ const updateMock = vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null })
 // spawn() eventually got called.
 let insertMock: ReturnType<typeof vi.fn>;
 
-import { importRunState, startImportRun, stopImportRun, MAX_IMPORT_LIMIT } from '../importRuns';
+import { importRunState, startImportRun, stopImportRun, MAX_IMPORT_LIMIT, DEFAULT_KEYWORD } from '../importRuns';
 
 // A minimal stand-in for the ChildProcess spawn() returns -- just enough
 // (stdout/stderr as EventEmitters, plus the process's own 'close'/'error'
@@ -109,7 +109,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true, limit: 100, dryRun: false });
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false, keyword: DEFAULT_KEYWORD });
         expect(spawnMock).toHaveBeenCalledTimes(1);
         expect(importRunState.running).toBe(true);
         expect(importRunState.limit).toBe(100);
@@ -159,7 +159,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true, limit: 100, dryRun: false });
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false, keyword: DEFAULT_KEYWORD });
         expect(spawnMock).toHaveBeenCalledTimes(1);
         // IMP1-04: the run still proceeds untracked (unchanged existing
         // behavior), but the DB row it would have needed for
@@ -179,7 +179,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(MAX_IMPORT_LIMIT * 10);
 
-        expect(result).toEqual({ started: true, limit: MAX_IMPORT_LIMIT, dryRun: false });
+        expect(result).toEqual({ started: true, limit: MAX_IMPORT_LIMIT, dryRun: false, keyword: DEFAULT_KEYWORD });
         expect(importRunState.limit).toBe(MAX_IMPORT_LIMIT);
         // The clamped value, not the requested one, is what actually
         // gets handed to the spawned script.
@@ -202,7 +202,7 @@ describe('startImportRun', () => {
 
         const result = await startImportRun(0);
 
-        expect(result).toEqual({ started: true, limit: 1, dryRun: false });
+        expect(result).toEqual({ started: true, limit: 1, dryRun: false, keyword: DEFAULT_KEYWORD });
 
         fakeChild.emit('close', 0);
     });
@@ -216,7 +216,7 @@ describe('startImportRun with dryRun', () => {
 
         const result = await startImportRun(100, true);
 
-        expect(result).toEqual({ started: true, limit: 100, dryRun: true });
+        expect(result).toEqual({ started: true, limit: 100, dryRun: true, keyword: DEFAULT_KEYWORD });
         expect(importRunState.dryRun).toBe(true);
         expect(insertMock).toHaveBeenCalledWith(expect.objectContaining({ dry_run: true }));
         const spawnArgs = spawnMock.mock.calls[0][1] as string[];
@@ -237,7 +237,7 @@ describe('startImportRun with dryRun', () => {
         spawnMock.mockReturnValue(fakeChild);
         const result = await startImportRun(100);
 
-        expect(result).toEqual({ started: true, limit: 100, dryRun: false });
+        expect(result).toEqual({ started: true, limit: 100, dryRun: false, keyword: DEFAULT_KEYWORD });
         expect(importRunState.dryRun).toBe(false);
         // Second call in this test -- index 1, not 0.
         const spawnArgs = spawnMock.mock.calls[1][1] as string[];

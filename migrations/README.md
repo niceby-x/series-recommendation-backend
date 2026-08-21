@@ -45,9 +45,15 @@ later files sometimes depend on tables/columns earlier ones create (e.g.
 | 009 | `009_episode_progress.sql` | Creates `user_episode_progress` | `PUT /watchlist/:seriesId/progress`, `GET /watchlist`'s `progress` field, `GET /me/activity`'s `progress` entries (H2-02) |
 | 010 | `010_series_release_date.sql` | Adds `release_date` to `series` | `GET /series`'s `release_date_min`/`release_date_max` filters and `sort=newest_release` |
 | 011 | `011_notifications_columns.sql` | Adds `episode_count_updated_at` to `series`, `notifications_seen_at` to `users` | `GET /me/notifications`, `POST /me/notifications/seen`, the `episode_count_updated_at` bump in `PATCH /admin/series/:id` (G3-01) |
+| 012 | `012_series_publish_status.sql` | Adds `publish_status` to `series` | `GET/PATCH/POST /admin/series`, public `GET /series` and `GET /series/:id` (excludes draft/archived) (S1-01) |
+| 013 | `013_import_runs_running_unique.sql` | Adds a partial unique index on `import_runs(status) WHERE status = 'running'` | `POST /admin/import/run` (IMP1-01) |
+| 014 | `014_import_runs_dry_run_column.sql` | Adds `dry_run` to `import_runs` | `POST /admin/import/run`, `GET /admin/import/status` (IMP2-03) |
+| 015 | `015_import_runs_summary_column.sql` | Adds `summary` (jsonb) to `import_runs` | `GET /admin/import/status`, `GET /admin/import/history` (IMP3-01, IMP3-03) |
+| 016 | `016_import_runs_keyword_column.sql` | Adds `keyword` to `import_runs` | `POST /admin/import/run`, `GET /admin/import/status`, `GET /admin/import/history` (IMP3-02, IMP3-03) |
 
-All eleven are assumed already applied to production as of this README's
-last update -- 011 is new, run it before deploying the notifications
-routes or `PATCH /admin/series/:id` will 500 the moment it tries to write
-a column that doesn't exist yet, and `GET /me/notifications` will 500 the
-same way reading `notifications_seen_at`.
+All sixteen are assumed already applied to production as of this README's
+last update -- 015 and 016 were backfilled into this log after the fact
+(the columns were already live; only the migration files themselves were
+missing), so there's nothing new to run for those two beyond what's
+already in Supabase. Run them anyway if you're setting up a fresh
+database from scratch.

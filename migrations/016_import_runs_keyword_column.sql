@@ -1,0 +1,18 @@
+-- Backfilled migration log entry -- same situation as
+-- 015_import_runs_summary_column.sql: this column has been live in
+-- production since IMP3-02 shipped, but the .sql file for it was never
+-- actually committed. Safe to run even though the column almost
+-- certainly already exists.
+--
+-- Run this before deploying anything that depends on it if you're
+-- setting up a fresh database -- GET /admin/import/status's DB-fallback
+-- branch selects this column, POST /admin/import/run's insert writes it
+-- for every new run, and IMP3-03's run history selects it too.
+--
+-- Defaults to the exact keyword every row from before this migration was
+-- actually searched for -- the discovery script had no --keyword option
+-- until IMP3-02, so "boys' love (bl)" (src/services/importRuns.ts's
+-- DEFAULT_KEYWORD) is not a guess, it's what those runs really did. New
+-- rows always pass their own effective keyword explicitly on insert, so
+-- this default only ever applies retroactively to pre-migration rows.
+alter table import_runs add column if not exists keyword text not null default 'boys'' love (bl)';
