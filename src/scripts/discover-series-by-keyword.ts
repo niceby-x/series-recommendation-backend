@@ -408,6 +408,21 @@ async function run() {
         console.log('  ' + country + ': ' + count);
     }
 
+    // IMP3-01: everything above is human-readable log output -- fine for
+    // a CLI run, but the admin page previously had no structured way to
+    // show these tallies without scrolling raw log text, and a future
+    // run-history view (IMP3-03) needs the same numbers per past row,
+    // not just the most recent run's log. This single line is the
+    // machine-readable counterpart: same countryTally/mediaTypeTally
+    // numbers already computed above, just also emitted as one parseable
+    // JSON line rather than only formatted for a human. The
+    // __IMPORT_SUMMARY__ prefix lets services/importRuns.ts's stdout
+    // handler pick this one line out of the rest of the log tail
+    // (appendImportLog strips it back out before it reaches the visible
+    // log) without needing a separate IPC channel -- stdout is already
+    // being piped and parsed for the log tail either way.
+    console.log('__IMPORT_SUMMARY__' + JSON.stringify({ added, mediaTypeTally, countryTally }));
+
     console.log('\nDone.');
 }
 

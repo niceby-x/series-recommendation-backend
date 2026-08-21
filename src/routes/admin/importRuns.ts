@@ -104,7 +104,7 @@ router.get('/status', async (req: Request, res: Response) => {
 
     const { data, error } = await supabase
         .from('import_runs')
-        .select('status, limit_per_type, started_at, finished_at, exit_code, log, error_message, dry_run')
+        .select('status, limit_per_type, started_at, finished_at, exit_code, log, error_message, dry_run, summary')
         .order('started_at', { ascending: false })
         .limit(1);
 
@@ -139,6 +139,11 @@ router.get('/status', async (req: Request, res: Response) => {
         // inferred from status, since a dry run can itself succeed,
         // error, get interrupted, or get cancelled just like a real one.
         dryRun: lastRun.dry_run,
+        // IMP3-01: mirrors the live branch's importRunState.summary --
+        // null for any row from before this migration, or for a run that
+        // errored/was stopped/got interrupted before the script reached
+        // its final __IMPORT_SUMMARY__ line, same as the live branch.
+        summary: lastRun.summary,
     });
 });
 

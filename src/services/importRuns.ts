@@ -55,6 +55,20 @@ export interface ImportRunState {
     // run history) tell a dry run apart from a real one that happened to
     // queue nothing. Reset to false at the start of every run.
     dryRun: boolean;
+    // IMP3-01: parsed from the script's __IMPORT_SUMMARY__ stdout line
+    // (see appendImportLog) once it prints one -- null until then, so the
+    // frontend can tell "no summary yet" (still running, or a run that
+    // errored/was stopped before it got that far) apart from "summary
+    // says zero of everything". Same countryTally/mediaTypeTally shape
+    // the script already computed for its own human-readable log; this is
+    // just the structured version of the same numbers.
+    summary: ImportRunSummary | null;
+}
+
+export interface ImportRunSummary {
+    added: number;
+    mediaTypeTally: Record<string, number>;
+    countryTally: Record<string, number>;
 }
 
 const MAX_IMPORT_LOG_LINES = 300;
@@ -87,15 +101,43 @@ export const importRunState: ImportRunState = {
     persisted: true,
     cancelled: false,
     dryRun: false,
+    summary: null,
 };
 
 let importChild: ChildProcess | null = null;
 let importRunDbId: number | null = null;
 let importLogFlushTimer: ReturnType<typeof setInterval> | null = null;
 
+const SUMMARY_LOG_PREFIX = '__IMPORT_SUMMARY__';
+
 function appendImportLog(chunk: string) {
     const lines = chunk.toString().split('\n').filter((l) => l.trim().length > 0);
-    importRunState.logTail.push(...lines);
+
+    for (const line of lines) {
+        // IMP3-01: the script emits one line prefixed with
+        // __IMPORT_SUMMARY__ containing the same countryTally/
+        // mediaTypeTally numbers as its human-readable summary, just as
+        // parseable JSON. Pull it out here rather than letting it reach
+        // the visible logTail -- it's meant for the admin UI's stat
+        // breakdown, not to be read as a log line, and would just look
+        // like a stray blob of JSON if left in the log panel. A malformed
+        // or unexpected line (e.g. truncated by a mid-write chunk split)
+        // is skipped rather than surfaced as an error -- the human log
+        // already has the same numbers, so a parse miss here only means
+        // the stat breakdown falls back to whatever import_runs already
+        // had, not a run that silently lost information.
+        if (line.startsWith(SUMMARY_LOG_PREFIX)) {
+            try {
+                importRunState.summary = JSON.parse(line.slice(SUMMARY_LOG_PREFIX.length));
+            } catch {
+                // Malformed/partial line -- leave importRunState.summary
+                // as it was rather than throwing out of a stdout handler.
+            }
+            continue;
+        }
+        importRunState.logTail.push(line);
+    }
+
     if (importRunState.logTail.length > MAX_IMPORT_LOG_LINES) {
         importRunState.logTail = importRunState.logTail.slice(-MAX_IMPORT_LOG_LINES);
     }
@@ -217,6 +259,7 @@ export async function startImportRun(
     importRunState.persisted = true;
     importRunState.cancelled = false;
     importRunState.dryRun = dryRun;
+    importRunState.summary = null;
 
     const { data: runRow, error: insertError } = await supabase
         .from('import_runs')
@@ -314,6 +357,16 @@ export async function startImportRun(
                     finished_at: importRunState.finishedAt,
                     exit_code: code,
                     log: importRunState.logTail.join('\n'),
+                    // IMP3-01: importRunState.summary is only ever set by
+                    // the script's final __IMPORT_SUMMARY__ stdout line,
+                    // which (barring a truncated chunk -- see
+                    // appendImportLog) has already landed by the time
+                    // 'close' fires, since Node only emits 'close' once
+                    // the child's stdio streams are fully drained. Stays
+                    // null here for a run that errored, was stopped, or
+                    // got interrupted before reaching that line -- same
+                    // as it already is in memory, nothing to invent.
+                    summary: importRunState.summary,
                 })
                 .eq('id', importRunDbId);
         }
