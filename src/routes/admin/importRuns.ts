@@ -7,6 +7,7 @@ import { supabase } from '../../services/supabase';
 import { requireAdmin } from '../../middleware/auth';
 import { importRunState, startImportRun, stopImportRun, DEFAULT_IMPORT_LIMIT } from '../../services/importRuns';
 import { getImportSchedule, updateImportSchedule } from '../../services/importSchedule';
+import { searchByTitle, findExistingTmdbIds, getFullRecordForAdd, upsertCandidate, MediaType } from '../../services/tmdbCandidates';
 
 const router = Router();
 
@@ -263,6 +264,104 @@ router.put('/schedule', async (req: Request, res: Response) => {
     }
 
     res.json({ message: 'Import schedule updated', data: result.config });
+});
+
+// IMP5-01 - Manual "search by title" for the admin add tool. GET rather
+// than POST since this is a pure read (no state change) -- q is the raw
+// title text, e.g. "Cherry Magic". Unlike the bulk discovery script,
+// this hits TMDB's /search/tv and /search/movie directly (see
+// searchByTitle in services/tmdbCandidates.ts), not /discover -- title
+// search finds a specific known show; it can't surface content the admin
+// doesn't already know the name of, which is the bulk importer's job.
+// Results are capped and each one is flagged with alreadyExists so the
+// admin can see at a glance what's already in the catalog/queue before
+// picking one to add.
+router.get('/search-title', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+
+    if (!query) {
+        return res.status(400).json({ message: 'A search query (?q=) is required.' });
+    }
+
+    // Cap here rather than trusting TMDB's own page size -- a very
+    // generic query (e.g. a single common word) could otherwise return
+    // more raw results than makes sense to show in a pick-one-and-add
+    // list. 20 mirrors how many results TMDB returns per page anyway.
+    const MAX_RESULTS = 20;
+
+    let results;
+    try {
+        results = (await searchByTitle(query)).slice(0, MAX_RESULTS);
+    } catch (err) {
+        return res.status(500).json({ message: 'Title search failed: ' + (err instanceof Error ? err.message : String(err)) });
+    }
+
+    const existingIds = await findExistingTmdbIds(results.map((r) => r.tmdbId));
+
+    res.json({
+        message: 'Title search results',
+        query,
+        results: results.map((r) => ({
+            tmdbId: r.tmdbId,
+            title: r.title,
+            originalTitle: r.originalTitle,
+            year: r.year,
+            mediaType: r.mediaType,
+            posterUrl: r.posterPath ? 'https://image.tmdb.org/t/p/w342' + r.posterPath : null,
+            overview: r.overview,
+            alreadyExists: existingIds.has(r.tmdbId),
+        })),
+    });
+});
+
+// IMP5-01 - Queue a single candidate by TMDB id + media type (admin
+// only), picked from a /search-title result. Only tmdbId and mediaType
+// are trusted from the request -- title/poster/etc. are re-fetched fresh
+// from TMDB here (getFullRecordForAdd) rather than accepting whatever the
+// client sent back from its earlier search, since that response could be
+// stale or altered by the time "Add" is clicked and this is the exact
+// field set that gets written to series_candidates. Writes through the
+// same upsertCandidate() the bulk discovery script uses, tagged with a
+// distinct source_keyword so manually-added candidates are identifiable
+// apart from discovery-sourced ones in the Editorial Queue.
+router.post('/add-by-tmdb-id', async (req: Request, res: Response) => {
+    const isAdmin = await requireAdmin(req, res);
+    if (!isAdmin) return;
+
+    const tmdbId = Number(req.body?.tmdbId);
+    const mediaType = req.body?.mediaType;
+
+    if (!Number.isFinite(tmdbId) || tmdbId <= 0) {
+        return res.status(400).json({ message: 'A valid tmdbId is required.' });
+    }
+    if (mediaType !== 'tv' && mediaType !== 'movie') {
+        return res.status(400).json({ message: 'mediaType must be "tv" or "movie".' });
+    }
+
+    const record = await getFullRecordForAdd(tmdbId, mediaType as MediaType);
+
+    if (!record) {
+        return res.status(502).json({ message: 'Could not fetch TMDB details for id ' + tmdbId + ' (' + mediaType + ').' });
+    }
+
+    // IMP5-01: distinct from any real discovery keyword string (which is
+    // always a bare TMDB keyword name, e.g. "boys' love (bl)") so a
+    // manually-added candidate is identifiable in the Editorial Queue /
+    // run history without a schema change -- source_keyword already
+    // accepts arbitrary text.
+    const result = await upsertCandidate(record.result, record.details, 'manual: title search');
+
+    if (result.status === 'error') {
+        return res.status(500).json({ message: result.message || 'Could not queue candidate.' });
+    }
+    if (result.status === 'duplicate') {
+        return res.status(409).json({ message: '"' + record.result.title + '" is already in the catalog or queue.' });
+    }
+
+    res.status(201).json({ message: 'Queued "' + record.result.title + '" for review', id: result.id, title: record.result.title });
 });
 
 export default router;
